@@ -6,6 +6,7 @@ import aexpect
 
 from avocado.core import exceptions
 from avocado.utils import software_manager
+from avocado.utils import path as utils_path
 from six import string_types
 
 from virttest import utils_misc
@@ -47,6 +48,8 @@ class RemotePackageMgr(object):
         self.remove_cmd = None
         self.clean_cmd = None
         self.session = session
+        self.provides_cmd = None
+        self.update_cache_cmd = None
 
         # Inspect and set package manager
         for pkg_mgr in PACKAGE_MANAGERS:
@@ -63,11 +66,14 @@ class RemotePackageMgr(object):
             self.remove_cmd = "apt-get --purge remove -y "
             self.install_cmd = "apt-get install -y "
             self.clean_cmd = "apt-get clean"
+            self.provides_cmd = "apt-file search"
+            self.update_cache_cmd = "apt-file update"
         else:
             self.query_cmd = "rpm -q "
             self.remove_cmd = self.package_manager + " remove -y "
             self.install_cmd = self.package_manager + " install -y "
             self.clean_cmd = self.package_manager + " clean all"
+            self.provides_cmd = self.package_manager + " provides"
 
     def clean(self):
         """
@@ -86,6 +92,37 @@ class RemotePackageMgr(object):
         """
         cmd = self.query_cmd + pkg_name
         return not self.session.cmd_status(cmd)
+
+    def provides(self):
+        """
+        Use package manager remove packages
+
+        :param filename: binary/file which needs package to be found
+        :return: if found return package name else False
+        """
+        error = False
+        if self.update_cache_cmd:
+            error = self.session.cmd_status(self.update_cache_cmd)
+        if not error:
+            package_list = {}
+            try:
+                for filename in self.pkg_list:
+                    if self.package_manager in  ('yum', 'dnf'):
+                        p_cmd = self.provides_cmd + " " + filename + "| grep 'noarch\|ppc' | tail -1 | awk -F ':' '{print $1}'"
+                    else:
+                        p_cmd = self.provides_cmd + " --regexp " + filename + "| awk -F ':' '{print $1}'"
+                    package_list[filename] = self.session(p_cmd)
+                    if not package_list[filename]:
+                        logging.error("Filename %s has no providers ", filename)
+                        error = True
+                if error:
+                    return None
+                else:
+                    return package_list
+            except process.CmdError:
+                    return None
+        else:
+            return False
 
     def operate(self, timeout, default_status, internal_timeout=2):
         """
@@ -115,7 +152,7 @@ class RemotePackageMgr(object):
                         return False
         return True
 
-    def install(self, timeout=300):
+    def install(self, pkg=None,timeout=300):
         """
         Use package manager install packages
 
@@ -123,6 +160,8 @@ class RemotePackageMgr(object):
         :return: if install succeed return True, else False
         """
         self.cmd = self.install_cmd
+        if pkg:
+            self.pkg_list = pkg
         return self.operate(timeout, False)
 
     def remove(self, timeout=300):
@@ -156,32 +195,46 @@ class LocalPackageMgr(software_manager.SoftwareManager):
         super(LocalPackageMgr, self).__init__()
         self.func = None
 
-    def operate(self, default_status):
+    def operate(self, default_status=False, provides=False):
         """
         Use package manager to operate packages
 
         :param default_status: package default installed status
         """
-        for pkg in self.pkg_list:
-            need = False
-            if '*' not in pkg:
-                if self.check_installed(pkg) == default_status:
+
+        if not provides:
+            for pkg in self.pkg_list:
+                need = False
+                if '*' not in pkg:
+                    if self.check_installed(pkg) == default_status:
+                        need = True
+                else:
                     need = True
-            else:
-                need = True
-            if need:
-                if not self.func(pkg):
-                    logging.error("Operate %s on host failed", pkg)
+                if need:
+                    if not self.func(pkg):
+                        logging.error("Operate %s on host failed", pkg)
+                        return False
+        else:
+            package_list = {}
+            for filename in self.pkg_list:
+                logging.info("operate: %s", filename)
+                package_list[filename] = self.func(filename)
+                if package_list[filename] == None:
+                    logging.error("Unable to find providing package for %s", filename)
                     return False
+            return package_list
+
         return True
 
-    def install(self):
+    def install(self, pkg=None):
         """
         Use package manager install packages
 
         :return: if install succeed return True, else False
         """
         self.func = super(LocalPackageMgr, self).__getattr__('install')
+        if pkg:
+            self.pkg_list = pkg
         return self.operate(False)
 
     def remove(self):
@@ -193,6 +246,14 @@ class LocalPackageMgr(software_manager.SoftwareManager):
         self.func = super(LocalPackageMgr, self).__getattr__('remove')
         return self.operate(True)
 
+    def provides(self):
+        """
+        Use package manager provides packages
+
+        :return: if remove succeed return True, else False
+        """
+        self.func = super(LocalPackageMgr, self).__getattr__('provides')
+        return self.operate(False,True)
 
 def package_manager(session, pkg):
     """
@@ -206,6 +267,7 @@ def package_manager(session, pkg):
         mgr = RemotePackageMgr(session, pkg)
     else:
         mgr = LocalPackageMgr(pkg)
+        logging.info("in LocalPackageMgr")
     return mgr
 
 
@@ -233,3 +295,21 @@ def package_remove(pkg, session=None, timeout=300):
     """
     mgr = package_manager(session, pkg)
     return utils_misc.wait_for(mgr.remove, timeout)
+
+def package_provides(filenames, session=None, timeout=300):
+    """
+    Try to find packages providing binaries on system with package manager.
+
+    :param pkg: binary or filenames
+    :param session: session Object
+    :param timeout: timeout for remove with session
+    :return: package which provides given file/binary, False if error, None if not found
+    """
+    mgr = package_manager(session, "")
+    logging.info("package_provides")
+    if session:
+        if not utils_misc.wait_for(mgr.install(mgr.provides_cmd.split(" ")[0]), timeout):
+            return False
+    mgr.pkg_list = filenames
+    logging.info("mgr.pkg_list: %s", mgr.pkg_list)
+    return utils_misc.wait_for(mgr.provides, timeout)

@@ -836,30 +836,25 @@ class Iscsi(object):
     @staticmethod
     def create_iSCSI(params, root_dir=data_dir.get_tmp_dir()):
         iscsi_instance = None
-        ubuntu = distro.detect().name == 'Ubuntu'
-        # check and install iscsi initiator packages
-        if ubuntu:
-            iscsi_package = ["open-iscsi"]
-        else:
-            iscsi_package = ["iscsi-initiator-utils"]
-
-        if not utils_package.package_install(iscsi_package):
-            raise exceptions.TestError("Failed to install iscsi initiator"
-                                       " packages")
-        # Install linux iscsi target software targetcli
-        iscsi_package = ["targetcli"]
-        if not utils_package.package_install(iscsi_package):
-            logging.error("Failed to install targetcli trying with scsi-"
-                          "target-utils or tgt package")
-            # try with scsi target utils if targetcli is not available
-            if ubuntu:
-                iscsi_package = ["tgt"]
-            else:
-                iscsi_package = ["scsi-target-utils"]
-            if not utils_package.package_install(iscsi_package):
-                raise exceptions.TestError("Failed to install iscsi target and"
-                                           " initiator packages")
+        tgt_targetcli = False
+        prereq_utils = ["iscsiadm", "targetcli"]
+        iscsi_packages = utils_package.package_provides(prereq_utils)
+        for prereq in prereq_utils:
+            if iscsi_packages[prereq] is None:
+                if "targetcli" not in prereq:
+                    raise exceptions.TestError("No package found which provides %s", prereq)
+                else:
+                    # try with scsi target utils if targetcli is not available
+                    iscsi_packages[prereq] = utils_package.package_provides(["tgtadm"])["tgtadm"]
+                    if iscsi_packages[prereq] is None:
+                        raise exceptions.TestError("No package found which provides targetcli")
+                    else:
+                        tgt_targetcli = True
+            if not utils_package.package_install(iscsi_packages[prereq]):
+                raise exceptions.TestError("Failed to install prereq packages: %s", iscsi_packages[prereq])
+        if tgt_targetcli:
             iscsi_instance = IscsiTGT(params, root_dir)
         else:
             iscsi_instance = IscsiLIO(params, root_dir)
+
         return iscsi_instance

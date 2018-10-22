@@ -1622,6 +1622,7 @@ def attach_disk(name, source, target, extra="", **dargs):
     """
     cmd = "attach-disk --domain %s --source %s --target %s %s"\
         % (name, source, target, extra)
+    logging.info("cmd: attachdisk: %s", cmd)
     return command(cmd, **dargs)
 
 
@@ -1635,6 +1636,7 @@ def detach_disk(name, target, extra="", **dargs):
     :return: CmdResult object
     """
     cmd = "detach-disk --domain %s --target %s %s" % (name, target, extra)
+    logging.info("cmd: detachdisk: %s", cmd)
     return command(cmd, **dargs)
 
 
