@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import traceback
+import functools
 
 from aexpect.exceptions import ShellError
 from aexpect.exceptions import ExpectError
@@ -27,6 +28,24 @@ class VMError(Exception):
 
     def __init__(self, *args):
         Exception.__init__(self, *args)
+
+
+class VMUnexpectedExitError(VMError):
+
+    def __init__(self, vm, exit_status=None):
+        super(VMUnexpectedExitError, self).__init__(vm, exit_status)
+        self.vm = vm
+        self.exit_status = exit_status
+        self.msg = None
+
+    def __str__(self):
+        if self.msg is None:
+            self.msg = "vm %s is exited unexpectedly%s."
+            if self.exit_status is None:
+                self.msg %= (self.vm, "")
+            else:
+                self.msg %= (self.vm, ", exit status: %s" % self.exit_status)
+        return self.msg
 
 
 class VMCreateError(VMError):
@@ -464,6 +483,31 @@ class CpuInfo(object):
         self.threads = threads
 
 
+def session_handler(func):
+    """
+    decorator method to handle uri and session for libvirt
+    """
+    @functools.wraps(func)
+    def manage_session(vm, *args, **kwargs):
+        connect_uri = None
+        uri = kwargs.get("connect_uri")
+        libvirt = vm.params.get("vm_type") == 'libvirt'
+        try:
+            if uri and libvirt:
+                connect_uri = vm.connect_uri
+                vm.connect_uri = uri
+                vm.session = vm.wait_for_serial_login()
+            else:
+                vm.session = vm.wait_for_login()
+            return func(vm, *args, **kwargs)
+        finally:
+            if vm.session:
+                vm.session.close()
+            if connect_uri:
+                vm.connect_uri = connect_uri
+    return manage_session
+
+
 class BaseVM(object):
 
     """
@@ -518,6 +562,7 @@ class BaseVM(object):
         self.name = name
         self.params = params
         self.serial_console = None
+        self.session = None
         # Create instance if not already set
         if not hasattr(self, 'instance'):
             self._generate_unique_id()
@@ -623,27 +668,35 @@ class BaseVM(object):
         if self.is_dead():
             raise VMDeadError
 
-    def get_distro(self):
+    @session_handler
+    def get_distro(self, connect_uri=None):
         """
         Get distribution name of the vm instance.
         """
-        session = self.wait_for_login()
-        distro_name = utils_misc.get_distro(session=session)
-        session.close()
-        return distro_name
+        return utils_misc.get_distro(session=self.session)
 
-    def sosreport(self, path=None, uri=None):
+    @session_handler
+    def uptime(self, connect_uri=None):
+        """
+        Get uptime of the vm instance.
+
+        :param connect_uri: Libvirt connect uri of vm
+        :return: uptime of the vm on success, None on failure
+        """
+        return utils_misc.get_uptime(self.session)
+
+    @session_handler
+    def sosreport(self, path=None, connect_uri=None):
         """
         Get sosreport of the vm instance
 
         :param path: local host path where guest sosreport to be saved
-        :param uri: Connect uri for libvirt
+        :param connect_uri: Connect uri for libvirt
 
         :return: host path where guest sosrepost saved, default to logdir
                  None if vm is not linux or sosreport fails.
         """
         log_path = None
-        connect_uri = None
         if not self.params["os_type"] == "linux":
             logging.warn("sosreport not applicable for %s",
                          self.params["os_type"])
@@ -652,26 +705,16 @@ class BaseVM(object):
             pkg = "sos"
             if "ubuntu" in self.get_distro().lower():
                 pkg = "sosreport"
-            if uri:
-                connect_uri = self.connect_uri
-                self.connect_uri = uri
-                session = self.wait_for_serial_login()
-            else:
-                session = self.wait_for_login()
-            guest_ip = self.get_address()
+            guest_ip = self.get_address(session=self.session)
             guest_user = self.params["username"]
             guest_pwd = self.params["password"]
-            log_path = utils_misc.get_sosreport(session=session,
+            log_path = utils_misc.get_sosreport(session=self.session,
                                                 remote_ip=guest_ip,
                                                 remote_pwd=guest_pwd,
                                                 remote_user=guest_user,
                                                 sosreport_name=self.name,
                                                 sosreport_pkg=pkg)
         finally:
-            if uri:
-                self.connect_uri = connect_uri
-            if session:
-                session.close()
             return log_path
 
     def get_mac_address(self, nic_index=0):
@@ -691,11 +734,17 @@ class BaseVM(object):
             raise VMMACAddressMissingError(nic_index)
         return mac
 
-    def get_address(self, index=0, ip_version="ipv4"):
+    def get_address(self, index=0, ip_version="ipv4", session=None,
+                    timeout=60.0):
         """
         Wrapper for self._get_address. if 'flexible_nic_index' is 'yes',
         will traverses from first nic to first element toward the end
         util get a reachable IP address;
+
+        :param index: Name or index of the NIC whose address is requested.
+        :param ip_version: IP version, value in 'ipv4' or 'ipv6,
+        :param session: remote host session, if VM is migrated
+        :param timeout: Timeout for retry verifying IP address and commands
         """
         nr_nics = len(self.virtnet.mac_list())
         nics_index = [index]
@@ -705,19 +754,23 @@ class BaseVM(object):
 
         for nic in nics_index:
             try:
-                return self._get_address(nic, ip_version)
+                return self._get_address(nic, ip_version, session=session,
+                                         timeout=timeout)
             except (VMMACAddressMissingError, VMIPAddressMissingError,
                     VMAddressVerificationError):
                 if nic == nics_index[-1]:
                     raise
 
-    def _get_address(self, index=0, ip_version="ipv4"):
+    def _get_address(self, index=0, ip_version="ipv4", session=None,
+                     timeout=60.0):
         """
         Return the IP address of a NIC or guest (in host space).
 
         :param index: Name or index of the NIC whose address is requested.
         :param ip_version: IP version, value in 'ipv4' or 'ipv6,
                            default value is 'ipv4'
+        :param session: ShellSession object of remote host
+        :param timeout: Timeout for retry verifying IP address and commands
         :return: 'localhost': Port redirection is in use
         :return: IP address of NIC if valid in arp cache.
         :raise VMMACAddressMissingError: If no MAC address is defined for the
@@ -732,6 +785,8 @@ class BaseVM(object):
         # TODO: Determine port redirection in use w/o checking nettype
         if nic.nettype not in ['bridge', 'macvtap']:
             hostname = socket.gethostname()
+            if session:
+                hostname = session.cmd_output("hostname -f", timeout=timeout)
             return socket.gethostbyname(hostname)
 
         mac = self.get_mac_address(index).lower()
@@ -747,7 +802,9 @@ class BaseVM(object):
 
         devs = set([nic.netdst]) if 'netdst' in nic else set()
         if not utils_net.verify_ip_address_ownership(ip_addr, [mac],
-                                                     devs=devs):
+                                                     devs=devs,
+                                                     session=session,
+                                                     timeout=timeout):
             self.address_cache.drop(mac_pattern % mac)
 
             nic_params = self.params.object_params(nic.nic_name)
@@ -910,13 +967,14 @@ class BaseVM(object):
         panic_re = "|".join(panic_re)
         if self.serial_console:
             data = self.serial_console.get_output()
-            if not data:
+            if data is None:
                 logging.warn("Unable to read serial console")
                 return
             match = re.search(panic_re, data, re.DOTALL | re.MULTILINE | re.I)
             if match:
                 raise VMDeadKernelCrashError(match.group(0))
 
+    @session_handler
     def verify_dmesg(self, dmesg_log_file=None, connect_uri=None):
         """
         Verify guest dmesg
@@ -925,19 +983,18 @@ class BaseVM(object):
                                guest dmesg to logging.debug.
         :param connect_uri: Libvirt connect uri of vm
         """
-        if(len(self.virtnet) > 0 and self.virtnet[0].nettype != "macvtap" and
-           not connect_uri):
-            session = self.wait_for_login()
-        else:
-            if connect_uri and self.params.get("vm_type", "qemu") == "libvirt":
-                self.connect_uri = connect_uri
-            session = self.wait_for_serial_login()
         level = self.params.get("guest_dmesg_level", 3)
         ignore_result = self.params.get("guest_dmesg_ignore", "no") == "yes"
-        utils_misc.verify_dmesg(dmesg_log_file=dmesg_log_file,
-                                ignore_result=ignore_result,
-                                level_check=level, session=session)
-        session.close()
+        serial_login = self.params.get("serial_login", "no") == "yes"
+        if serial_login:
+            self.session = self.wait_for_serial_login()
+        elif(len(self.virtnet) > 0 and self.virtnet[0].nettype != "macvtap" and
+             not connect_uri):
+            self.session = self.wait_for_login()
+        return utils_misc.verify_dmesg(dmesg_log_file=dmesg_log_file,
+                                       ignore_result=ignore_result,
+                                       level_check=level,
+                                       session=self.session)
 
     def verify_bsod(self, scrdump_file):
         # For windows guest
@@ -963,7 +1020,7 @@ class BaseVM(object):
         """
         if self.serial_console is not None:
             data = self.serial_console.get_output()
-            if not data:
+            if data is None:
                 logging.warn("Unable to read serial console")
                 return
             match = re.findall(r".*trap invalid opcode.*\n", data,
@@ -985,21 +1042,6 @@ class BaseVM(object):
         """
         return os.path.join(data_dir.get_tmp_dir(),
                             "testlog-%s" % self.instance)
-
-    def get_virtio_port_filename(self, port_name):
-        """
-        Return the filename corresponding to a givven monitor name.
-        """
-        return os.path.join(data_dir.get_tmp_dir(),
-                            "virtio_port-%s-%s" % (port_name, self.instance))
-
-    def get_virtio_port_filenames(self):
-        """
-        Return a list of all virtio port filenames (as specified in the VM's
-        params).
-        """
-        return [self.get_virtio_port_filename(v) for v in
-                self.params.objects("virtio_ports")]
 
     @error_context.context_aware
     def login(self, nic_index=0, timeout=LOGIN_TIMEOUT,
@@ -1357,17 +1399,14 @@ class BaseVM(object):
             else:
                 self.send_key(char)
 
-    def get_cpu_count(self):
+    @session_handler
+    def get_cpu_count(self, check_cmd='cpu_chk_cmd', connect_uri=None):
         """
         Get the cpu count of the VM.
         """
-        session = self.wait_for_login()
-        cmd = self.params.get("cpu_chk_cmd")
-        try:
-            out = session.cmd_output_safe(cmd)
-            return int(re.search("\d+", out, re.M).group())
-        finally:
-            session.close()
+        cmd = self.params.get(check_cmd)
+        out = self.session.cmd_output_safe(cmd)
+        return int(re.search("\d+", out, re.M).group())
 
     def get_memory_size(self, cmd=None, timeout=60):
         """
@@ -1395,21 +1434,35 @@ class BaseVM(object):
         cmd = self.params.get("mem_chk_cur_cmd")
         return self.get_memory_size(cmd)
 
-    def get_totalmem_sys(self):
+    def get_totalmem_sys(self, online='yes', node=''):
         """
         To get the total guest memory(ram) as detected by system
         MemTotal in /proc/meminfo would display
         total usable memory(i.e. physical ram minus
         a few reserved bits and the kernel binary code)
-
+        :param online: if 'yes', count the total online memory size
+        :param node: if given will count mem on that numa node
         :return: system memory in Kb as float
         """
         session = self.wait_for_login()
         try:
-            cmd = "count=0;cd /sys/devices/system/memory/;for i in `ls`;"
-            cmd += "do [ -f $i/online ] && a=$(<$i/online) && "
+            if node != '':
+                cmd = "count=0;[ -d /sys/devices/system/node/node%s/ ] && " % node
+                cmd += "cd /sys/devices/system/node/node%s/;" % node
+                cmd += "for i in `ls -d memory*`;"
+            else:
+                cmd = "count=0;cd /sys/devices/system/memory/;for i in `ls`;"
+            if online == 'yes':
+                cmd += "do [ -f $i/online ] && a=$(<$i/online) && "
+            else:
+                cmd += "do [ -f $i/online ] && a=1 && "
             cmd += "count=$(( $count + $a ));a=0;done;echo $count"
-            no_memblocks = int(session.cmd_output(cmd, timeout=360))
+            output = session.cmd_status_output(cmd, timeout=360)
+            # Handle memory less numa nodes
+            if "ls: cannot access 'memory*':" in output[1]:
+                no_memblocks = 0
+            else:
+                no_memblocks = int(output[1])
             cmd = "cat /sys/devices/system/memory/block_size_bytes"
             block_size = int(session.cmd_output(cmd), 16)
             return (no_memblocks * block_size)/1024.0

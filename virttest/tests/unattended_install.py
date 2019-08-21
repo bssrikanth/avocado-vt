@@ -168,6 +168,10 @@ class UnattendedInstallConfig(object):
         for a in self.attributes:
             setattr(self, a, params.get(a, ''))
 
+        # Make finish.bat work well with positional arguments
+        if not self.process_check.strip():  # pylint: disable=E0203
+            self.process_check = '""'       # pylint: disable=E0203
+
         # Will setup the virtio attributes
         v_attributes = ['virtio_floppy', 'virtio_scsi_path',
                         'virtio_storage_path', 'virtio_network_path',
@@ -394,6 +398,11 @@ class UnattendedInstallConfig(object):
             raise ValueError("Unexpected installation medium %s" % self.url)
         contents = re.sub(dummy_medium_re, content, contents)
 
+        dummy_rh_system_stream_id_re = r'\bRH_SYSTEM_STREAM_ID\b'
+        if re.search(dummy_rh_system_stream_id_re, contents):
+            rh_system_stream_id = self.params.get("rh_system_stream_id", "")
+            contents = re.sub(dummy_rh_system_stream_id_re, rh_system_stream_id, contents)
+
         dummy_repos_re = r'\bKVM_TEST_REPOS\b'
         if re.search(dummy_repos_re, contents):
             repo_list = self.params.get("kickstart_extra_repos", "").split()
@@ -523,6 +532,13 @@ class UnattendedInstallConfig(object):
                       self.virtio_balloon_path, self.virtio_viorng_path,
                       self.virtio_vioser_path, self.virtio_pvpanic_path,
                       self.virtio_vioinput_path]
+
+            # XXX: Force to replace the drive letter which loaded the
+            # virtio driver by the specified letter.
+            letter = self.params.get('virtio_drive_letter')
+            if letter is not None:
+                values = (re.sub(r'^\w+', letter, val) for val in values)
+
             for path, value in list(zip(paths, values)):
                 if value:
                     path_text = path.childNodes[0]
@@ -653,12 +669,12 @@ class UnattendedInstallConfig(object):
 
     def setup_unattended_http_server(self):
         '''
-        Setup a builtin http server for serving the kickstart file
+        Setup a builtin http server for serving the kickstart/preseed file
 
-        Does nothing if unattended file is not a kickstart file
+        Does nothing if unattended file is not a kickstart/preseed file
         '''
-        if self.unattended_file.endswith('.ks'):
-            # Red Hat kickstart install
+        if self.unattended_file.endswith('.ks') or self.unattended_file.endswith('.preseed'):
+            # Red Hat kickstart install or Ubuntu preseed install
             dest_fname = 'ks.cfg'
 
             answer_path = os.path.join(self.tmpdir, dest_fname)
@@ -1012,6 +1028,9 @@ class UnattendedInstallConfig(object):
                  (self.nfs_server, self.nfs_dir, self.nfs_mount))
         process.run(m_cmd, verbose=DEBUG)
 
+        if not os.path.isdir(self.image_path):
+            os.makedirs(self.image_path)
+
         try:
             kernel_fetch_cmd = ("cp %s/%s/%s %s" %
                                 (self.nfs_mount, self.boot_path,
@@ -1138,6 +1157,73 @@ def string_in_serial_log(serial_log_file_path, string):
         return False
 
 
+def attempt_to_log_useful_files(test, vm):
+    """
+    Tries to use ssh or serial_console to get logs from usual locations.
+    """
+    if not vm.is_alive():
+        return
+    base_dst_dir = os.path.join(test.outputdir, vm.name)
+    sessions = []
+    close = []
+    try:
+        try:
+            session = vm.wait_for_login()
+            close.append(session)
+            sessions.append(session)
+        except Exception as details:
+            pass
+        if vm.serial_console:
+            sessions.append(vm.serial_console)
+        for i, console in enumerate(sessions):
+            failures = False
+            try:
+                console.cmd("true")
+            except Exception as details:
+                logging.info("Skipping log_useful_files #%s: %s", i, details)
+                continue
+            failures = False
+            for path_glob in ["/*.log", "/tmp/*.log", "/var/tmp/*.log"]:
+                try:
+                    status, paths = console.cmd_status_output("ls -1 %s"
+                                                              % path_glob)
+                    if status:
+                        continue
+                except Exception as details:
+                    failures = True
+                    continue
+                for path in paths.splitlines():
+                    if not path:
+                        continue
+                    if path.startswith(os.path.sep):
+                        rel_path = path[1:]
+                    else:
+                        rel_path = path
+                    dst = os.path.join(test.outputdir, vm.name, str(i),
+                                       rel_path)
+                    dst_dir = os.path.dirname(dst)
+                    if not os.path.exists(dst_dir):
+                        os.makedirs(dst_dir)
+                    with open(dst, 'w') as fd_dst:
+                        try:
+                            fd_dst.write(console.cmd("cat %s" % path))
+                            logging.info('Attached "%s" log file from guest '
+                                         'at "%s"', path, base_dst_dir)
+                        except Exception as details:
+                            logging.warning("Unknown exception while "
+                                            "attempt_to_log_useful_files(): "
+                                            "%s", details)
+                            fd_dst.write("Unknown exception while getting "
+                                         "content: %s" % details)
+                            failures = True
+            if not failures:
+                # All commands succeeded, no need to use next session
+                break
+    finally:
+        for session in close:
+            session.close()
+
+
 @error_context.context_aware
 def run(test, params, env):
     """
@@ -1185,13 +1271,6 @@ def run(test, params, env):
         process.system(dd_cmd)
     image_name = os.path.basename(dst)
     mount_point = params.get("dst_dir")
-
-    # libvirt import of guest from NFS shared path, then copy image
-    # from image_path to nfs mount dir
-    if(params.get("virt_test_type", "qemu") == "libvirt" and
-       params.get("storage_type") == "nfs"):
-        storage.copy_nfs_image(params, image_name, vt_data_dir)
-
     if mount_point and src:
         funcatexit.register(env, params.get("type"), copy_file_from_nfs, src,
                             dst, mount_point, image_name)
@@ -1228,6 +1307,8 @@ def run(test, params, env):
     install_error_str = params.get("install_error_str")
     install_error_exception_str = ("Installation error reported in serial "
                                    "console log: %s" % install_error_str)
+    rh_upgrade_error_str = params.get("rh_upgrade_error_str",
+                                      "RH system upgrade failed")
     post_finish_str = params.get("post_finish_str",
                                  "Post set up finished")
     install_timeout = int(params.get("install_timeout", 4800))
@@ -1260,6 +1341,7 @@ def run(test, params, env):
                               src, dst, mount_point, image_name)
 
     send_key_timeout = int(params.get("send_key_timeout", 60))
+    kickstart_reboot_bug = params.get("kickstart_reboot_bug", "no") == "yes"
     while (time.time() - start_time) < install_timeout:
         try:
             vm.verify_alive()
@@ -1273,6 +1355,8 @@ def run(test, params, env):
                 try:
                     install_error_str_found = string_in_serial_log(
                         log_file, install_error_str)
+                    rh_upgrade_error_str_found = string_in_serial_log(
+                        log_file, rh_upgrade_error_str)
                     post_finish_str_found = string_in_serial_log(
                         log_file, post_finish_str)
                 except IOError:
@@ -1280,8 +1364,26 @@ def run(test, params, env):
                 else:
                     if install_error_str_found:
                         raise exceptions.TestFail(install_error_exception_str)
+                    if rh_upgrade_error_str_found:
+                        raise exceptions.TestFail("rh system upgrade failed, please "
+                                                  "check serial log")
                     if post_finish_str_found:
                         break
+                # Bug `reboot` param from the kickstart is not actually restarts
+                # the VM instead it shutsoff this is temporary workaround
+                # for the test to proceed
+                if unattended_install_config.unattended_file:
+                    with open(unattended_install_config.unattended_file) as unattended_fd:
+                        reboot_in_unattended = "reboot" in unattended_fd.read()
+                    if (reboot_in_unattended and kickstart_reboot_bug and not
+                            vm.is_alive()):
+                        try:
+                            vm.start()
+                            break
+                        except:
+                            logging.warn("Failed to start unattended install "
+                                         "image workaround reboot kickstart "
+                                         "parameter bug")
 
                 # Print out the original exception before copying images.
                 logging.error(e)
@@ -1293,6 +1395,7 @@ def run(test, params, env):
         try:
             test.verify_background_errors()
         except Exception as e:
+            attempt_to_log_useful_files(test, vm)
             copy_images()
             raise e
 
@@ -1300,6 +1403,8 @@ def run(test, params, env):
             try:
                 install_error_str_found = string_in_serial_log(
                     log_file, install_error_str)
+                rh_upgrade_error_str_found = string_in_serial_log(
+                    log_file, rh_upgrade_error_str)
                 post_finish_str_found = string_in_serial_log(
                     log_file, post_finish_str)
             except IOError:
@@ -1311,7 +1416,11 @@ def run(test, params, env):
                         serial_read_fails)
             else:
                 if install_error_str_found:
+                    attempt_to_log_useful_files(test, vm)
                     raise exceptions.TestFail(install_error_exception_str)
+                if rh_upgrade_error_str_found:
+                    raise exceptions.TestFail("rh system upgrade failed, please "
+                                              "check serial log")
                 if post_finish_str_found:
                     break
 
@@ -1330,6 +1439,7 @@ def run(test, params, env):
             time.sleep(1)
     else:
         logging.warn("Timeout elapsed while waiting for install to finish ")
+        attempt_to_log_useful_files(test, vm)
         copy_images()
         raise exceptions.TestFail("Timeout elapsed while waiting for install to "
                                   "finish")

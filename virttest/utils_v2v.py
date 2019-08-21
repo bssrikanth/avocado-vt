@@ -22,6 +22,7 @@ from virttest import ppm_utils
 from virttest import data_dir
 from virttest import remote
 from virttest import utils_misc
+from virttest import ssh_key
 
 try:
     V2V_EXEC = path.find_command('virt-v2v')
@@ -71,9 +72,13 @@ class Uri(object):
         """
         Return esx uri.
         """
-        uri = "vpx://root@%s/%s/%s/?no_verify=1" % (self.host,
-                                                    self.vpx_dc,
-                                                    self.esx_ip)
+        uri = ''
+        if self.vpx_dc and self.esx_ip:
+            uri = "vpx://root@%s/%s/%s/?no_verify=1" % (self.host,
+                                                        self.vpx_dc,
+                                                        self.esx_ip)
+        if not self.vpx_dc and self.esx_ip:
+            uri = "esx://root@%s/?no_verify=1" % self.esx_ip
         return uri
 
     # add new hypervisor in here.
@@ -91,6 +96,44 @@ class Target(object):
             target = "libvirt"
         self.target = target
         self.uri = uri
+        # Save NFS mount records like {0:(src, dst, fstype)}
+        self.mount_records = {}
+        # authorized_keys in remote vmx host
+        self.authorized_keys = []
+
+    def cleanup(self):
+        """
+        Cleanup NFS mount records
+        """
+        for src, dst, fstype in self.mount_records.values():
+            utils_misc.umount(src, dst, fstype)
+
+        self.cleanup_authorized_keys_in_vmx()
+
+    def cleanup_authorized_keys_in_vmx(self):
+        """
+        Clean up authorized_keys in vmx server
+        """
+        session = None
+        if len(self.authorized_keys) == 0:
+            return
+
+        try:
+            session = remote.remote_login(
+                client='ssh',
+                host=self.esxi_host,
+                port=22,
+                username=self.username,
+                password=self.esxi_password,
+                prompt=r"[\#\$\[\]]",
+                preferred_authenticaton='password,keyboard-interactive')
+            for key in self.authorized_keys:
+                session.cmd(
+                    "sed -i '/%s/d' /etc/ssh/keys-root/authorized_keys" %
+                    key)
+        finally:
+            if session:
+                session.close()
 
     def get_cmd_options(self, params):
         """
@@ -100,6 +143,17 @@ class Target(object):
         self.params = params
         self.output_method = self.params.get('output_method', 'rhev')
         self.input_mode = self.params.get('input_mode')
+        self.esxi_host = self.params.get(
+            'esxi_host', self.params.get('esx_ip'))
+        self.datastore = self.params.get('datastore')
+        self.src_uri_type = params.get('src_uri_type')
+        self.esxi_password = params.get('esxi_password')
+        self.input_transport = self.params.get('input_transport')
+        self.vddk_libdir = self.params.get('vddk_libdir')
+        self.vddk_libdir_src = self.params.get('vddk_libdir_src')
+        self.vddk_thumbprint = self.params.get('vddk_thumbprint')
+        self.vcenter_host = self.params.get('vcenter_host')
+        self.vcenter_password = self.params.get('vcenter_password')
         self.vm_name = self.params.get('main_vm')
         self.bridge = self.params.get('bridge')
         self.network = self.params.get('network')
@@ -108,7 +162,84 @@ class Target(object):
         self.format = self.params.get('output_format', 'raw')
         self.input_file = self.params.get('input_file')
         self.new_name = self.params.get('new_name')
+        self.username = self.params.get('username', 'root')
+        self.vmx_nfs_src = self.params.get('vmx_nfs_src')
+        self.has_genid = self.params.get('has_genid')
         self.net_vm_opts = ""
+
+        def _compose_vmx_filename():
+            """
+            Return vmx filename for '-i vmx'.
+            """
+            mount_point = v2v_mount(self.vmx_nfs_src, 'vmx_nfs_src')
+            self.mount_records[len(self.mount_records)] = (
+                self.vmx_nfs_src, mount_point, None)
+
+            vmx_filename = "{}/{name}/{name}.vmx".format(
+                mount_point, name=self.vm_name)
+
+            return vmx_filename
+
+        def _compose_input_transport_options():
+            """
+            Set input transport options for v2v
+            """
+            options = ''
+            if self.input_transport is None:
+                return options
+
+            # -it vddk
+            if self.input_transport == 'vddk':
+                if self.vddk_libdir is None or not os.path.isdir(
+                        self.vddk_libdir):
+                    # Invalid nfs mount source if no ':'
+                    if self.vddk_libdir_src is None or ':' not in self.vddk_libdir_src:
+                        logging.error(
+                            'Neither vddk_libdir nor vddk_libdir_src was set')
+                        raise exceptions.TestError(
+                            "VDDK library directory or NFS mount point must be set")
+
+                    mount_point = v2v_mount(
+                        self.vddk_libdir_src, 'vddk_libdir')
+                    self.vddk_libdir = mount_point
+                    self.mount_records[len(self.mount_records)] = (
+                        self.vddk_libdir_src, self.vddk_libdir, None)
+
+                # Invalid vddk thumbprint if no ':'
+                if self.vddk_thumbprint is None or ':' not in self.vddk_thumbprint:
+                    self.vddk_thumbprint = get_vddk_thumbprint(
+                        *
+                        (
+                            self.esxi_host,
+                            self.esxi_password,
+                            self.src_uri_type) if self.src_uri_type == 'esx' else (
+                            self.vcenter_host,
+                            self.vcenter_password,
+                            self.src_uri_type))
+
+            # -it ssh
+            if self.input_transport == 'ssh':
+                pub_key = setup_esx_ssh_key(
+                    self.esxi_host, self.username, self.esxi_password)
+                self.authorized_keys.append(pub_key.split()[1].split('/')[0])
+                utils_misc.add_identities_into_ssh_agent()
+
+            # New input_transport type can be added here
+
+            # A dict to save input_transport types and their io options, new it_types
+            # should be added here. Their io values were composed during running time
+            # based on user's input
+            input_transport_args = {
+                'vddk': "-io vddk-libdir=%s -io vddk-thumbprint=%s" % (self.vddk_libdir,
+                                                                       self.vddk_thumbprint),
+                'ssh': "ssh://root@{}/vmfs/volumes/{}/{name}/{name}.vmx".format(
+                    self.esxi_host,
+                    self.datastore,
+                    name=self.vm_name)}
+
+            options = " -it %s " % (self.input_transport)
+            options += input_transport_args[self.input_transport]
+            return options
 
         if self.bridge:
             self.net_vm_opts += " -b %s" % self.bridge
@@ -116,9 +247,12 @@ class Target(object):
         if self.network:
             self.net_vm_opts += " -n %s" % self.network
 
-        self.net_vm_opts += " %s" % self.vm_name
+        if self.input_mode != 'vmx':
+            self.net_vm_opts += " %s" % self.vm_name
+        elif self.input_transport is None:
+            self.net_vm_opts += " %s" % _compose_vmx_filename()
 
-        options = opts_func()
+        options = opts_func() + _compose_input_transport_options()
 
         if self.new_name:
             options += ' -on %s' % self.new_name
@@ -155,10 +289,10 @@ class Target(object):
         Return command options.
         """
         options = " -ic %s -o %s -os %s -of %s" % (
-                    self.uri,
-                    self.output_method.replace('_', '-'),
-                    self.storage if self.output_method != "rhv_upload" else self.storage_name,
-                    self.format)
+            self.uri,
+            self.output_method.replace('_', '-'),
+            self.storage if self.output_method != "rhv_upload" else self.storage_name,
+            self.format)
         options = options + self.net_vm_opts
 
         return options
@@ -208,7 +342,7 @@ class VMCheck(object):
         self.export_name = params.get('export_name')
         self.delete_vm = 'yes' == params.get('vm_cleanup', 'yes')
         self.virsh_session_id = params.get("virsh_session_id")
-        self.windows_root = params.get("windows_root", "C:\WINDOWS")
+        self.windows_root = params.get("windows_root", r"C:\WINDOWS")
         self.output_method = params.get("output_method")
         # Need create session after create the instance
         self.session = None
@@ -625,7 +759,7 @@ class WindowsVMCheck(VMCheck):
         """
         Get viostor info.
         """
-        cmd = "dir %s\Drivers\VirtIO\\viostor.sys" % self.windows_root
+        cmd = r"dir %s\Drivers\VirtIO\\viostor.sys" % self.windows_root
         return self.run_cmd(cmd)[1]
 
     def get_driver_info(self, signed=True):
@@ -640,12 +774,12 @@ class WindowsVMCheck(VMCheck):
         while count > 0:
             logging.debug('%d times remaining for getting driver info' % count)
             try:
+                # Clean up output
+                self.session.cmd('cls')
                 output = self.session.cmd_output(cmd)
             except Exception as detail:
                 logging.error(detail)
                 count -= 1
-                # Clean up output
-                self.session.cmd('cls')
             else:
                 break
         if not output:
@@ -661,7 +795,7 @@ class WindowsVMCheck(VMCheck):
         status, output = self.run_cmd(cmd)
         if status != 0:
             # For win2003 and winXP, use following cmd
-            cmd = "CSCRIPT %s\system32\eventquery.vbs " % self.windows_root
+            cmd = r"CSCRIPT %s\system32\eventquery.vbs " % self.windows_root
             cmd += "/l application /Fi \"Source eq WSH\""
             output = self.run_cmd(cmd)[1]
         return output
@@ -701,32 +835,46 @@ def v2v_cmd(params):
 
     target = params.get('target')
     hypervisor = params.get('hypervisor')
+    # vpx:// or esx://
+    src_uri_type = params.get('src_uri_type')
     hostname = params.get('hostname')
     vpx_dc = params.get('vpx_dc')
-    esx_ip = params.get('esx_ip')
+    esxi_host = params.get('esxi_host', params.get('esx_ip'))
     opts_extra = params.get('v2v_opts')
-    v2v_timeout = params.get('v2v_timeout', 2400)
+    # Set v2v_timeout to 3 hours, the value can give v2v enough time to execute,
+    # and avoid v2v process be killed by mistake.
+    # the value is bigger than the timeout value in CI, so when some timeout
+    # really happens, CI will still interrupt the v2v process.
+    v2v_timeout = params.get('v2v_timeout', 10800)
     rhv_upload_opts = params.get('rhv_upload_opts')
 
     uri_obj = Uri(hypervisor)
     # Return actual 'uri' according to 'hostname' and 'hypervisor'
-    uri = uri_obj.get_uri(hostname, vpx_dc, esx_ip)
+    if src_uri_type == 'esx':
+        vpx_dc = None
+    uri = uri_obj.get_uri(hostname, vpx_dc, esxi_host)
 
     target_obj = Target(target, uri)
-    # Return virt-v2v command line options based on 'target' and 'hypervisor'
-    options = target_obj.get_cmd_options(params)
+    try:
+        # Return virt-v2v command line options based on 'target' and
+        # 'hypervisor'
+        options = target_obj.get_cmd_options(params)
 
-    if rhv_upload_opts:
-        options = options + ' ' + rhv_upload_opts
-    if opts_extra:
-        options = options + ' ' + opts_extra
+        if rhv_upload_opts:
+            options = options + ' ' + rhv_upload_opts
+        if opts_extra:
+            options = options + ' ' + opts_extra
 
-    # Construct a final virt-v2v command
-    cmd = '%s %s' % (V2V_EXEC, options)
-    cmd_result = process.run(cmd, timeout=v2v_timeout,
-                             verbose=True, ignore_status=True)
+        # Construct a final virt-v2v command
+        cmd = '%s %s' % (V2V_EXEC, options)
+        cmd_result = process.run(cmd, timeout=v2v_timeout,
+                                 verbose=True, ignore_status=True)
+    finally:
+        target_obj.cleanup()
+
     cmd_result.stdout = results_stdout_52lts(cmd_result)
     cmd_result.stderr = results_stderr_52lts(cmd_result)
+
     return cmd_result
 
 
@@ -794,7 +942,7 @@ def check_log(params, log):
 
     def _check_log(pattern_list, expect=True):
         for pattern in pattern_list:
-            line = '\s*'.join(pattern.split())
+            line = r'\s*'.join(pattern.split())
             expected = 'expected' if expect else 'not expected'
             logging.info('Searching for %s log: %s' % (expected, pattern))
             compiled_pattern = re.compile(line)
@@ -865,3 +1013,88 @@ def cleanup_constant_files(params):
                 params.get("vpx_passwd_file")]
 
     map(os.remove, [x for x in tmpfiles if x and os.path.isfile(x)])
+
+
+def get_vddk_thumbprint(host, password, uri_type, prompt=r"[\#\$\[\]]"):
+    """
+    Get vddk thumbprint from VMware vCenter
+
+    :param host: hostname or IP address
+    :param password: Password
+    :param uri_type: conversion source uri type
+    :param prompt: Shell prompt (regular expression)
+    """
+
+    if uri_type == 'esx':
+        cmd = 'openssl x509 -in /etc/vmware/ssl/rui.crt -fingerprint -sha1 -noout'
+    else:
+        cmd = 'openssl x509 -in /etc/vmware-vpx/ssl/rui.crt -fingerprint -sha1 -noout'
+
+    r_runner = remote.RemoteRunner(
+        host=host,
+        password=password,
+        prompt=prompt,
+        preferred_authenticaton='password,keyboard-interactive')
+    cmdresult = r_runner.run(cmd)
+    logging.debug("vddk thumbprint:\n%s", cmdresult.stdout)
+    vddk_thumbprint = cmdresult.stdout.strip().split('=')[1]
+
+    return vddk_thumbprint
+
+
+def setup_esx_ssh_key(hostname, username, password, port=22):
+    """
+    Setup up remote login in esx server by using public key
+
+    :param hostname: hostname or IP address
+    :param username: username
+    :param password: Password
+    :param port: ssh port number
+    """
+    session = None
+    logging.debug('Performing SSH key setup on %s:%d as %s.' %
+                  (hostname, port, username))
+    try:
+        session = remote.remote_login(
+            client='ssh',
+            host=hostname,
+            username=username,
+            port=port,
+            password=password,
+            prompt=r"[\#\$\[\]]",
+            preferred_authenticaton='password,keyboard-interactive')
+        public_key = ssh_key.get_public_key()
+        session.cmd("echo '%s' >> /etc/ssh/keys-root/authorized_keys; " %
+                    public_key)
+        logging.debug('SSH key setup complete.')
+
+        return public_key
+    except Exception as err:
+        raise exceptions.TestFail("SSH key setup failed: '%s'" % err)
+    finally:
+        if session:
+            session.close()
+
+
+def v2v_mount(src, dst='v2v_mount_point'):
+    """
+    Mount nfs src to dst
+
+    :param src: NFS source
+    :param dst: NFS mount point
+    """
+    mount_point = os.path.join(
+        data_dir.get_tmp_dir(), dst)
+    if not os.path.exists(mount_point):
+        os.makedirs(mount_point)
+
+    if not utils_misc.mount(
+        src,
+        mount_point,
+        'nfs',
+            verbose=True):
+        raise exceptions.TestError(
+            'Mount %s for %s failed' %
+            (src, mount_point))
+
+    return mount_point

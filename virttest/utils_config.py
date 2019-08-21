@@ -427,6 +427,7 @@ class LibvirtQemuConfig(LibvirtConfigCommon):
         'migration_address': 'string',
         'migration_port_min': 'int',
         'migration_port_max': 'int',
+        'namespaces': 'list',
     }
 
 
@@ -447,6 +448,7 @@ class LibvirtdSysConfig(LibvirtConfigCommon):
         'QEMU_AUDIO_DRV': 'string',
         'SDL_AUDIODRIVER': 'string',
         'LIBVIRTD_NOFILES_LIMIT': 'int',
+        'DAEMON_COREFILE_LIMIT': 'string',
     }
 
 

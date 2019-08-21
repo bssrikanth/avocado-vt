@@ -55,6 +55,7 @@ from virttest import utils_misc
 from virttest import utils_net
 from virttest import virt_vm
 from virttest import utils_package
+from virttest.utils_iptables import Iptables
 from virttest import data_dir
 from virttest.staging import utils_memory
 from virttest.compat_52lts import results_stdout_52lts, decode_to_text
@@ -126,8 +127,36 @@ def update_boot_option_ubuntu(args, grub_key=None, session=None, remove_args=Non
     logging.debug("updated boot option: %s with %s", grub_key, args)
 
 
-@error_context.context_aware
-def update_boot_option(vm, args_removed=None, args_added=None,
+def check_kernel_cmdline(session, remove_args="", args=""):
+    """
+    Method to check whether args are already exists or not in /proc/cmdline
+
+    :param session: Shell session Object
+    :param remove_args: arguments to be checked whether it doesn't exists
+                        or to remove.
+    :param args: arguments to be checked whether already exists or to add
+    :return: required arguments to be added/removed of type str
+    """
+    req_args = ""
+    req_remove_args = ""
+    proc_cmdline = "cat /proc/cmdline"
+    try:
+        check_output = str(session.cmd(proc_cmdline, timeout=60)).split()
+        # check whether the kernel options are already available and
+        # whether really needed to be added/removed respectively
+        for each_arg in args.split():
+            if each_arg not in check_output:
+                req_args += "%s " % each_arg
+        for each_arg in remove_args.split():
+            if each_arg in check_output:
+                req_remove_args += "%s " % each_arg
+    except Exception as info:
+        raise exceptions.TestError("Failed to get kernel commandline using %s:"
+                                   " %s" % (proc_cmdline, info))
+    return req_args.strip(), req_remove_args.strip()
+
+
+def update_boot_option(vm, args_removed="", args_added="",
                        need_reboot=True):
     """
     Update guest default kernel option.
@@ -139,49 +168,65 @@ def update_boot_option(vm, args_removed=None, args_added=None,
     :raise exceptions.TestError: Raised if fail to update guest kernel cmdline.
 
     """
+    session = None
     if vm.params.get("os_type") == 'windows':
         # this function is only for linux, if we need to change
         # windows guest's boot option, we can use a function like:
         # update_win_bootloader(args_removed, args_added, reboot)
         # (this function is not implement.)
         # here we just:
+        msg = "update_boot_option() is supported only for Linux guest"
+        logging.warning(msg)
         return
-
     login_timeout = int(vm.params.get("login_timeout"))
     session = vm.wait_for_login(timeout=login_timeout)
-    if "ubuntu" in vm.get_distro().lower():
-        if args_added:
-            update_boot_option_ubuntu(args_added, session=session)
-        if args_removed:
-            update_boot_option_ubuntu(args_removed, session=session,
-                                      remove_args=True)
-    else:
-        if not utils_package.package_install("grubby", session=session):
-            raise exceptions.TestError("Failed to install grubby package")
-        msg = "Update guest kernel option. "
-        cmd = "grubby --update-kernel=`grubby --default-kernel` "
-        if args_removed is not None:
-            msg += " remove args: %s" % args_removed
-            cmd += '--remove-args="%s" ' % args_removed
-        if args_added is not None:
-            msg += " add args: %s" % args_added
-            cmd += '--args="%s"' % args_added
-        error_context.context(msg, logging.info)
-        status, output = session.cmd_status_output(cmd)
-        if status != 0:
-            logging.error(output)
-            raise exceptions.TestError("Fail to modify guest kernel option")
+    try:
+        # check for args that are really required to be added/removed
+        req_args, req_remove_args = check_kernel_cmdline(session,
+                                                         remove_args=args_removed,
+                                                         args=args_added)
+        if "ubuntu" in vm.get_distro().lower():
+            if req_args:
+                update_boot_option_ubuntu(req_args, session=session)
+            if req_remove_args:
+                update_boot_option_ubuntu(req_remove_args, session=session,
+                                          remove_args=True)
+        else:
+            if not utils_package.package_install("grubby", session=session):
+                raise exceptions.TestError("Failed to install grubby package")
+            msg = "Update guest kernel option. "
+            cmd = "grubby --update-kernel=`grubby --default-kernel` "
+            if req_remove_args:
+                msg += " remove args: %s" % req_remove_args
+                cmd += '--remove-args="%s" ' % req_remove_args
+            if req_args:
+                msg += " add args: %s" % req_args
+                cmd += '--args="%s"' % req_args
+            if req_remove_args or req_args:
+                logging.info(msg)
+                status, output = session.cmd_status_output(cmd)
+                if status != 0:
+                    logging.error(output)
+                    raise exceptions.TestError(
+                        "Fail to modify guest kernel option")
 
-    if need_reboot:
-        error_context.context("Rebooting guest ...", logging.info)
-        session = vm.reboot(session=session, timeout=login_timeout)
-    cmdline = session.cmd("cat /proc/cmdline", timeout=60)
-    if args_removed and args_removed in cmdline:
-        err = "Fail to remove guest kernel option %s" % args_removed
-        raise exceptions.TestError(err)
-    if args_added and args_added not in cmdline:
-        err = "Fail to add guest kernel option %s" % args_added
-        raise exceptions.TestError(err)
+        # reboot is required only if we really add/remove any args
+        if need_reboot and (req_args or req_remove_args):
+            logging.info("Rebooting guest ...")
+            session = vm.reboot(session=session, timeout=login_timeout)
+            # check nothing is required to be added/removed by now
+            req_args, req_remove_args = check_kernel_cmdline(session,
+                                                             remove_args=args_removed,
+                                                             args=args_added)
+            if req_remove_args:
+                err = "Fail to remove guest kernel option %s" % args_removed
+                raise exceptions.TestError(err)
+            if req_args:
+                err = "Fail to add guest kernel option %s" % args_added
+                raise exceptions.TestError(err)
+    finally:
+        if session:
+            session.close()
 
 
 def stop_windows_service(session, service, timeout=120):
@@ -315,7 +360,8 @@ def get_time(session, time_command, time_filter_re, time_format):
     elif re.findall("hwclock", time_command):
         loc = locale.getlocale(locale.LC_TIME)
         # Get and parse host time
-        host_time_out = results_stdout_52lts(process.run(time_command, shell=True))
+        host_time_out = results_stdout_52lts(
+            process.run(time_command, shell=True))
         diff = host_time_out.split()[-2]
         host_time_out = " ".join(host_time_out.split()[:-2])
         try:
@@ -419,6 +465,34 @@ def get_memory_info(lvms):
     meminfo = meminfo[0:-2] + "}"
 
     return meminfo
+
+
+def find_bin(session, try_binaries=[]):
+    """
+    Look for the binary installed in the guest.
+
+    :param session: A shell session.
+    :param try_binaries: A list of binaries names to look for.
+    :return: The binary found, otherwise None.
+    """
+    for binary in try_binaries:
+        if session.cmd_status("which %s" % binary) == 0:
+            return binary
+
+
+def find_python(session, compat="python3"):
+    """
+    Look for the python binary installed in the guest.
+
+    :param session: A shell session.
+    :param compat: preference to compat version
+    """
+    binaries = ['python', 'python2', 'python3']
+    compat_bin = find_bin(session, try_binaries=[compat])
+    if not compat_bin:
+        binaries.remove(compat)
+        return find_bin(session, try_binaries=binaries)
+    return compat_bin
 
 
 @error_context.context_aware
@@ -646,7 +720,8 @@ def run_virtio_serial_file_transfer(test, params, env, port_name=None,
                     return port.hostfile
 
     def run_host_cmd(host_cmd, timeout=720):
-        return decode_to_text(process.system_output(host_cmd, timeout=timeout))
+        return decode_to_text(process.system_output(
+            host_cmd, shell=True, timeout=timeout))
 
     def transfer_data(session, host_cmd, guest_cmd, n_time, timeout,
                       md5_check, action):
@@ -723,7 +798,7 @@ def run_virtio_serial_file_transfer(test, params, env, port_name=None,
 
     dir_name = data_dir.get_tmp_dir()
     transfer_timeout = int(params.get("transfer_timeout", 720))
-    tmp_dir = params.get("tmp_dir", data_dir.get_tmp_dir())
+    tmp_dir = params.get("tmp_dir", '/var/tmp/')
     filesize = int(params.get("filesize", 10))
     count = int(filesize)
 
@@ -762,14 +837,14 @@ def run_virtio_serial_file_transfer(test, params, env, port_name=None,
     host_script = params.get("host_script", "serial_host_send_receive.py")
     host_script = os.path.join(data_dir.get_root_dir(), "shared", "deps",
                                "serial", host_script)
-    host_cmd = "python %s -s %s -f %s -a %s" % (host_script, host_device,
-                                                host_data_file, action)
+    host_cmd = ("`command -v python python3 | head -1` %s -s %s -f %s -a %s"
+                % (host_script, host_device, host_data_file, action))
     guest_script = params.get("guest_script",
                               "VirtIoChannel_guest_send_receive.py")
     guest_script = os.path.join(guest_path, guest_script)
 
-    guest_cmd = "python %s -d %s -f %s -a %s" % (guest_script, port_name,
-                                                 guest_data_file, guest_action)
+    guest_cmd = ("`command -v python python3 | head -1` %s -d %s -f %s -a %s"
+                 % (guest_script, port_name, guest_data_file, guest_action))
     n_time = int(params.get("repeat_times", 1))
     txt += " for %s times" % n_time
     try:
@@ -782,164 +857,287 @@ def run_virtio_serial_file_transfer(test, params, env, port_name=None,
         session.close()
 
 
-def run_avocado(vm, params, test, testlist=[], timeout=3600,
-                testrepo="https://github.com/avocado-framework-tests/avocado-misc-tests.git",
-                installtype="pip", reinstall=False, add_args=None, ignore_result=True):
+def session_handler(func):
     """
-    Function to run avocado tests inside guest
-
-    :param vm: VM object
-    :param params: VM param
-    :param test: test object
-    :param testlist: testlist as list of tuples like (testcase, muxfile)
-    :param timeout: test timeout
-    :param testrepo: test repository default is avocado-misc-tests
-    :param installtype: how to install avocado, supported types
-                        pip, package, git
-    :param reinstall: flag to reinstall incase of avocado present inside guest
-    :param add_args: additional arguments to be passed to the avocado cmdline
-    :param ignore_result: True or False
-    :return: Bool result status
+    decorator method to handle session for Stress
     """
-    plugins = {'pip': ['avocado-framework-plugin-varianter-yaml-to-mux', 'avocado-framework-plugin-result-html'],
-               'package': [],
-               'git': ['varianter_yaml_to_mux', 'html']}
-    prerequisites = ['python', 'git']
 
-    def env_check():
+    def manage_session(self):
+        try:
+            if self.vm or self.remote_host:
+                self.session = self.get_session()
+            return func(self)
+        finally:
+            if (self.vm or self.remote_host) and self.session:
+                self.session.close()
+    return manage_session
+
+
+class AvocadoGuest(object):
+
+    def __init__(self, vm, params, test, testlist=[], timeout=3600,
+                 testrepo="https://github.com/avocado-framework-tests/avocado-misc-tests.git",
+                 installtype="pip", avocado_vt=False, reinstall=False,
+                 add_args="", ignore_result=True):
+        """
+        Class to run Avocado/Avocado-VT tests inside guest
+
+        :param vm: VM object
+        :param params: VM param
+        :param test: test object
+        :param testlist: testlist as list of tuples like (testcase, muxfile)
+        :param timeout: test timeout
+        :param testrepo: test repository default is avocado-misc-tests
+        :param installtype: how to install avocado, supported types
+                            pip, package, git
+        :param reinstall: flag to reinstall incase of avocado present inside guest
+        :param add_args: additional arguments to be passed to the avocado cmdline
+        :param ignore_result: True or False
+        :return: Bool result status
+        """
+        self.vm = vm
+        self.params = params
+        self.test = test
+        self.testlist = testlist
+        self.timeout = timeout
+        self.test_repo = testrepo
+        self.installtype = installtype
+        self.avocado_vt = avocado_vt
+        self.reinstall = reinstall
+        self.add_args = add_args
+        self.ignore_result = "yes" if ignore_result else "no"
+        self.session = None
+        self.test_path = self.params.get("vm_test_path", "/var/tmp/avocado/")
+        self.kvm_module = self.params.get("nested_kvm_module", "kvm_hv")
+        self.result_path = os.path.join(self.test_path, "results")
+        self.avocado_repo = self.params.get("avocado_repo_path",
+                                            "https://github.com/avocado-framework/avocado.git")
+        self.avocado_repo_branch = self.params.get("avocado_repo_branch", "")
+        self.plugins = {'pip': ['avocado-framework-plugin-varianter-yaml-to-mux', 'avocado-framework-plugin-result-html'],
+                        'package': [],
+                        'git': ['varianter_yaml_to_mux', 'html']}
+        self.plugins_path = os.path.join(self.test_path,
+                                         self.repo_name(self.avocado_repo),
+                                         "optional_plugins")
+        self.prerequisites = {'packages': ['git'],
+                              'python': ['python', 'python-pip', 'python-devel'],
+                              'python2': ['python2', 'python2-pip', 'python2-devel']}
+        if self.avocado_vt:
+            self.vt_type = self.params.get("vt_type", "qemu")
+            self.vt_arch = self.params.get("vt_arch", "")
+            self.vt_only_filter = self.params.get("vt_only_filter", "")
+            self.vt_no_filter = self.params.get("vt_no_filter", "")
+            self.vt_extra_params = self.params.get("vt_extra_params", "")
+            self.guest_image = self.params.get("vt_guest_image", "")
+            self.package_list = self.params.get("vt_guest_packages", "").split(",")
+            vt_package_list = ['attr', 'gcc', '@Virtualization*', 'tcpdump']
+            self.prerequisites['packages'].extend(vt_package_list)
+            if self.package_list:
+                self.prerequisites['packages'].extend(self.package_list)
+            if self.installtype == 'pip':
+                self.plugins['pip'].append('avocado-framework-plugin-avocado-vt')
+            elif self.installtype == 'git':
+                self.avocado_vt_repo = self.params.get("avocado_vt_repo",
+                                                       "https://github.com/avocado-framework/avocado-vt.git")
+                self.avocado_vt_repo_branch = self.params.get("avocado_vt_repo_branch", "")
+        if not self.env_check():
+            raise exceptions.TestError("avocado env check failed, "
+                                       "consult previous errors")
+        if not self.install_avocado():
+            raise exceptions.TestError("avocado installation failed, "
+                                       "consult previous errors")
+
+    @session_handler
+    def env_check(self):
         """
         Check prerequisites
         """
         # TODO: Try installing the prerequisites
-        err_msg = "Following packages not availale: "
-        check = True
-        for item in prerequisites:
-            cmd = "which %s" % item
-            if session.cmd_status(cmd) > 0:
-                check = False
-                err_msg += "%s " % item
-        if not check:
-            err_msg += "\nConsider install them and rerun"
-            raise exceptions.TestError(err_msg)
+        for _, packages in self.prerequisites.iteritems():
+            pacman = utils_package.package_manager(self.session, packages)
+            if not pacman.install(timeout=self.timeout):
+                logging.error("Failed to install - %s", packages)
+        self.python = find_python(self.session, compat='python')
+        if not self.python:
+            logging.error("Unable to find python.")
+            return False
+        self.pip_bin = find_bin(self.session, ['pip', 'pip2', 'pip3'])
+        if not utils_misc.make_dirs(self.test_path, session=self.session):
+            logging.error("Failed to create test path in guest")
+            return False
+        if self.avocado_vt:
+            cmd = "lsmod | grep %s || modprobe %s" % (self.kvm_module,
+                                                      self.kvm_module)
+            if self.session.cmd_status(cmd, timeout=self.timeout) != 0:
+                logging.error("nested kvm module not available")
+                return False
+            cmd = "service libvirtd restart"
+            if self.session.cmd_status(cmd, timeout=self.timeout) != 0:
+                logging.error("Failed to restart libvirtd inside guest")
+                return False
+            pip_pack = ['setuptools', 'netifaces', 'aexpect', 'netaddr']
+            cmd = ""
+            for each in pip_pack:
+                cmd += "%s install %s --upgrade;" % (self.pip_bin, each)
+            if self.session.cmd_status(cmd, timeout=self.timeout) != 0:
+                logging.error("Failed to update pip and its packages")
+                return False
+        if not utils_misc.make_dirs(self.result_path, session=self.session):
+            logging.error("Failed to create result path in guest")
+            return False
+        return True
 
-    def install_avocado(installtype="pip"):
+    @session_handler
+    def install_avocado(self):
         """
-        Install avocado
+        Method to install Avocado/Avocado-VT and its plugins
         """
         logging.debug("Installing avocado")
         status = 0
-        if (session.cmd_status("which avocado") == 0) and not reinstall:
+        if (self.session.cmd_status("which avocado") == 0) and not self.reinstall:
             return True
-        if "pip" in installtype:
-            cmd = "python -m pip --version || python -c \"import os; import sys;"
-            cmd += " from six.moves import urllib;" \
-                   "f = urllib.request.urlretrieve(\'https://bootstrap.pypa.io/get-pip.py\')[0]; "
-            cmd += "os.system(\'%s %s\' % (sys.executable, f))\""
-            if session.cmd_status(cmd) > 0:
-                logging.error("pip installation failed")
+        if "pip" in self.installtype:
+            pip_install_cmd = "%s install" % self.pip_bin
+            cmd = "%s avocado-framework" % pip_install_cmd
+            status, output = self.session.cmd_status_output(cmd, timeout=self.timeout)
+            if status != 0:
+                logging.error("Avocado pip installation failed:\n%s", output)
                 return False
-            cmd = "pip install avocado-framework"
-            if session.cmd_status(cmd) > 0:
-                logging.error("Avocado pip installation failed")
-                return False
-            for plugin in plugins[installtype]:
-                cmd = "pip install %s" % plugin
-                if session.cmd_status(cmd) > 0:
+            for plugin in self.plugins[self.installtype]:
+                cmd = "%s %s" % (pip_install_cmd, plugin)
+                status, output = self.session.cmd_status_output(cmd, timeout=self.timeout)
+                if status != 0:
                     logging.error("Avocado plugin %s pip "
-                                  "installation failed", plugin)
+                                  "installation failed:\n%s", plugin, output)
                     return False
-        elif "package" in installtype:
+        elif "package" in self.installtype:
             raise NotImplementedError
-        elif "git" in installtype:
-            test_path = params.get("vm_test_path", "/var/tmp/avocado/")
-            cmd = "git clone https://github.com/avocado-framework/avocado.git;"
-            cmd += "cd avocado;python setup.py install"
-            if session.cmd_status(cmd) > 0:
+        elif "git" in self.installtype:
+            if not self.git_install(self.avocado_repo,
+                                    branch=self.avocado_repo_branch):
                 logging.error("Avocado git installation failed")
                 return False
-            for plugin in plugins[installtype]:
-                cmd = "[ -d optional_plugins/%s ] && cd optional_plugins/" % plugin
-                cmd += "%s && python setup.py install && cd .." % plugin
-                if session.cmd_status(cmd) > 0:
+            for plugin in self.plugins[self.installtype]:
+                cmd = "cd %s;" % os.path.join(self.plugins_path, plugin)
+                cmd += "%s setup.py install" % self.python
+                if self.session.cmd_status(cmd, timeout=self.timeout) != 0:
                     logging.error("Avocado plugin %s git "
                                   "installation failed", plugin)
                     return False
+            if self.avocado_vt and not self.git_install(self.avocado_vt_repo,
+                                                        make='requirements',
+                                                        branch=self.avocado_vt_repo_branch):
+                logging.error("Avocado-VT git installation failed")
+                return False
         return True
 
-    def runtest(session, testrepo, testlist, timeout, result_path, test_path):
+    def git_install(self, repo_path, branch="", make="", install=True):
         """
-        run test
+        method to clone and install from git repo inside guest
+
+        :param repo_path: repo link to be cloned
         """
-        success = True
 
-        cmd = "[ -n \"$(ls %s)\" ]" % test_path
-        if session.cmd_status(cmd) > 0:
-            cmd = "mkdir -p %s" % test_path
-            session.cmd(cmd)
+        cmd = "cd %s;" % self.test_path
+        cmd += "rm -rf %s" % self.repo_name(repo_path)
+        self.session.cmd(cmd, timeout=self.timeout)
+        cmd = "git clone %s" % repo_path
+        if branch:
+            cmd += " -b %s" % branch
+        cmd += " && cd %s;" % self.repo_name(repo_path)
+        if make:
+            cmd += "make %s;" % make
+        if install:
+            cmd += "%s setup.py install" % self.python
+        return self.session.cmd_status(cmd, timeout=self.timeout) == 0
 
-        cmd = "[ -n \"$(ls %s)\" ]" % result_path
-        if session.cmd_status(cmd) > 0:
-            cmd = "mkdir -p %s" % result_path
-            session.cmd(cmd)
+    def repo_name(self, repo_path):
+        """ Wrapper to return the repo name """
+        return repo_path.split(os.sep)[-1].split(".")[0]
 
+    def runtest(self):
+        """
+        Run test method to download the tests and trigger avocado command
+        """
         logging.debug("Downloading Test")
-        cmd = "cd %s;[ -d %s ] || git clone %s" % (test_path,
-                                                   testrepo.split("/")[-1].split('.')[0],
-                                                   testrepo)
-        status, output = session.cmd_status_output(cmd, timeout=100)
-        if status > 0:
-            raise exceptions.TestError("Downloading test failed: %s" % output)
-        logging.debug("Running Test")
-        for test in testlist:
-            mux = ""
-            testcase = test[0]
-            testcase = os.path.join(test_path,
-                                    testrepo.split("/")[-1].split('.')[0],
-                                    testcase)
-            try:
-                mux = test[1]
-            except KeyError:
-                pass
-            cmd = "avocado run %s --job-results-dir %s --job-timeout %d" % (
-                testcase, result_path, timeout)
-            if mux:
-                cmd += " -m %s" % mux
-            if add_args:
-                cmd += " %s" % add_args
-            status, output = session.cmd_status_output(cmd, timeout=timeout)
-            if status > 0:
-                # TODO: Map test return status with error strings and print
-                logging.error("Testcase: %s has failures consult "
-                              "the logs for details\nstatus: "
-                              "%s\nstdout: %s", testcase, status, output)
-                success = False
-        return success
+        if self.avocado_vt:
+            cmd = "avocado vt-bootstrap --yes-to-all"
+            if self.vt_type:
+                cmd += " --vt-type %s" % self.vt_type
+            if self.guest_image:
+                cmd += " --vt-guest-os %s" % self.guest_image
+            if self.vt_arch:
+                cmd += ".%s" % self.vt_arch
+            status, output = self.session.cmd_status_output(cmd, timeout=self.timeout)
+            if status != 0:
+                raise exceptions.TestError("Downloading test failed: %s" % output)
+        else:
+            if not self.git_install(self.test_repo, install=False):
+                raise exceptions.TestError("Downloading test failed")
 
-    def get_results(test_path, result_path, session):
+        logging.debug("Running Test")
+        avocado_cmd = "avocado run"
+        if self.avocado_vt:
+            avocado_cmd += " %s" % self.testlist[0].strip()
+            if self.vt_type:
+                avocado_cmd += " --vt-type %s" % self.vt_type
+            if self.vt_only_filter:
+                avocado_cmd += " --vt-only-filter \"%s\"" % self.vt_only_filter
+            if self.vt_no_filter:
+                avocado_cmd += " --vt-no-filter \"%s\"" % self.vt_no_filter
+            if self.vt_arch:
+                avocado_cmd += " --vt-arch %s" % self.vt_arch
+            if self.vt_extra_params:
+                avocado_cmd += " --vt-extra-params \"%s\"" % self.vt_extra_params
+        else:
+            for test_each in self.testlist:
+                mux = ""
+                testcase = test_each[0]
+                testcase = os.path.join(self.test_path,
+                                        self.repo_name(self.test_repo),
+                                        testcase)
+                avocado_cmd += " %s" % testcase
+                try:
+                    mux = test_each[1]
+                except KeyError:
+                    pass
+                if mux:
+                    avocado_cmd += " -m %s" % mux
+        if self.add_args:
+            avocado_cmd += " %s" % self.add_args
+        avocado_cmd += " --job-results-dir %s --job-timeout %d" % (self.result_path,
+                                                                   self.timeout)
+        status, output = self.session.cmd_status_output(avocado_cmd,
+                                                        timeout=self.timeout)
+        if status != 0:
+            # TODO: Map test return status with error strings and print
+            logging.error("Avocado cmd: %s has failures consult "
+                          "the logs for details\nstatus: "
+                          "%s\nstdout: %s", avocado_cmd, status, output)
+        return status == 0
+
+    def get_results(self):
         """
         Copy avocado results present on the guest back to the host.
         """
         logging.debug("Trying to copy avocado results from guest")
-        cmd = "[ -n \"$(ls %s)\" ]" % result_path
-        if session.cmd_status(cmd) > 0:
-            raise exceptions.TestError("No results folder found")
-        guest_results_dir = utils_misc.get_path(test.debugdir,
-                                                "guest_avocado_results")
+        guest_results_dir = utils_misc.get_path(self.test.debugdir,
+                                                self.vm.name)
         os.makedirs(guest_results_dir)
         logging.debug("Guest avocado test results placed "
                       "under %s", guest_results_dir)
         # result info tarball to host result dir
-        results_tarball = os.path.join(test_path, "results.tgz")
-        compress_cmd = "cd %s && " % result_path
+        results_tarball = os.path.join(self.test_path, "results.tgz")
+        compress_cmd = "cd %s && " % self.result_path
         compress_cmd += "tar cjvf %s" % results_tarball
         compress_cmd += " --exclude=*core*"
         compress_cmd += " --exclude=*crash*"
         compress_cmd += " ./*"
-        session.cmd(compress_cmd, timeout=600)
-        vm.copy_files_from(results_tarball, guest_results_dir)
+        self.session.cmd(compress_cmd, timeout=self.timeout)
+        self.vm.copy_files_from(results_tarball, guest_results_dir)
         # cleanup results dir from guest
-        clean_cmd = "rm -f %s;rm -rf %s" % (results_tarball, result_path)
-        session.cmd(clean_cmd, timeout=240)
+        clean_cmd = "rm -f %s;rm -rf %s" % (results_tarball, self.result_path)
+        self.session.cmd(clean_cmd, timeout=self.timeout)
         results_tarball = os.path.basename(results_tarball)
         results_tarball = os.path.join(guest_results_dir, results_tarball)
         uncompress_cmd = "tar xjvf %s -C %s" % (results_tarball,
@@ -947,28 +1145,32 @@ def run_avocado(vm, params, test, testlist=[], timeout=3600,
         process.run(uncompress_cmd)
         process.run("rm -f %s" % results_tarball)
 
-    # Run test
-    try:
-        session = vm.wait_for_login()
-    except Exception:
-        raise exceptions.TestError("Unable to get VM session, "
-                                   "skipped to run avocado test")
+    def get_session(self):
+        """
+        Method to get the session of the vm instance
+        """
+        try:
+            return self.vm.wait_for_login()
+        except aexpect.ShellError as detail:
+            raise exceptions.TestError("Unable to get VM session, "
+                                       "skipped to run avocado test: %s" %
+                                       detail)
 
-    test_path = params.get("vm_test_path", "/var/tmp/avocado/")
-    result_path = os.path.join(test_path, "results")
-    if not install_avocado(installtype):
-        exceptions.TestError("avocado installation failed, "
-                             "consult previous errors")
-    test_status = runtest(session, testrepo, testlist,
-                          timeout, result_path, test_path)
-    get_results(test_path, result_path, session)
-    # Cleanup
-    session.cmd("rm -rf %s" % test_path)
-
-    if not test_status and not ignore_result:
-        exceptions.TestFail("consult previous errors")
-    else:
-        return test_status
+    @session_handler
+    def run_avocado(self):
+        """
+        Method to run avocado, check dmesg and copy the results to host
+        """
+        try:
+            self.vm.params["guest_dmesg_ignore"] = self.ignore_result
+            test_status = self.runtest()
+            if not test_status and not self.ignore_result:
+                raise exceptions.TestFail("consult previous errors")
+            return test_status
+        finally:
+            self.get_results()
+            # Cleanup
+            self.session.cmd("rm -rf %s" % self.test_path, timeout=self.timeout)
 
 
 def run_autotest(vm, session, control_path, timeout,
@@ -1108,7 +1310,7 @@ def run_autotest(vm, session, control_path, timeout,
         # cleanup autotest subprocess which not terminated, change PWD to
         # avoid current connection kill by fuser command;
         clean_cmd = "cd /tmp && fuser -k %s" % results_dir
-        session.sendline(clean_cmd)
+        session.cmd(clean_cmd, ignore_all_errors=True)
         session.cmd("rm -f %s" % results_tarball, timeout=240)
         results_tarball = os.path.basename(results_tarball)
         results_tarball = os.path.join(guest_results_dir, results_tarball)
@@ -1498,7 +1700,7 @@ def get_loss_ratio(output):
     :param output: Ping output.
     """
     try:
-        return int(re.findall('(\d+)%.*loss', output)[0])
+        return float(re.findall(r'(\d*\.?\d+)%.*loss', output)[0])
     except IndexError:
         logging.warn("Invaild output of ping command: %s" % output)
     return -1
@@ -1787,7 +1989,8 @@ def get_date(session=None):
         raise exceptions.TestFail("Get date failed. %s " % detail)
 
 
-def run_avocado_bg(vm, params, test):
+def run_avocado_bg(vm, params, test, testlist=[], avocado_vt=False,
+                   ignore_status=True):
     """
     Function to run avocado tests inside guest in background
 
@@ -1796,29 +1999,21 @@ def run_avocado_bg(vm, params, test):
     :param test: test object
     :return: background test thread
     """
-    testlist = []
-    avocado_test = params.get("avocado_test", "")
-    avocado_mux = params.get("avocado_mux", "")
     avocado_testargs = params.get("avocado_testargs", "")
     avocado_timeout = int(params.get("avocado_timeout", 3600))
     avocado_testrepo = params.get("avocado_testrepo",
                                   "https://github.com/avocado-framework-tests/avocado-misc-tests.git")
-    for index, item in enumerate(avocado_test.split(',')):
-        try:
-            mux = ''
-            mux = avocado_mux.split(',')[index]
-        except IndexError:
-            pass
-        testlist.append((item, mux))
-    if testlist:
-        bt = BackgroundTest(run_avocado,
-                            [vm, params, test, testlist,
-                             avocado_timeout, avocado_testrepo, "pip",
-                             True, avocado_testargs, True])
+    try:
+        avocado_obj = AvocadoGuest(vm, params, test, testlist, avocado_timeout,
+                                   avocado_testrepo, installtype="pip",
+                                   avocado_vt=avocado_vt, reinstall=True,
+                                   add_args=avocado_testargs,
+                                   ignore_result=ignore_status)
+        bt = BackgroundTest(avocado_obj.run_avocado, params)
         bt.start()
         return bt
-    else:
-        logging.warning("Background guest tests not run")
+    except Exception as info:
+        logging.warning("Background guest tests not run: %s", info)
         return None
 
 
@@ -1835,22 +2030,6 @@ class StressError(Exception):
 
     def __str__(self):
         return self.msg
-
-
-def session_handler(func):
-    """
-    decorator method to handle session for Stress
-    """
-
-    def manage_session(self):
-        try:
-            if self.vm or self.remote_host:
-                self.session = self.get_session()
-            return func(self)
-        finally:
-            if self.vm or self.remote_host:
-                self.session.close()
-    return manage_session
 
 
 class Stress(object):
@@ -1895,16 +2074,23 @@ class Stress(object):
         self.remote_host = None
         self.copy_files_to = remote.copy_files_to
         self.params = params
-        self.stress_shell_timeout = int(self.params.get('stress_shell_timeout', 600))
-        self.stress_wait_for_timeout = int(self.params.get('stress_wait_for_timeout', 60))
+        self.stress_shell_timeout = int(
+            self.params.get('stress_shell_timeout', 600))
+        self.stress_wait_for_timeout = int(
+            self.params.get('stress_wait_for_timeout', 60))
         self.stress_type = stress_type
         stress_cmds = stress_cmds or stress_type
         self.stress_cmds = self.params.get('stress_cmds_%s' % stress_type,
                                            stress_cmds)
         self.stress_args = self.params.get("%s_args" % stress_type,
                                            stress_args)
+        self.stress_package = self.params.get("stress_package")
+        self.stress_install_from_repo = self.params.get(
+            "stress_install_from_repo") == "yes"
         self.download_url = self.params.get('download_url_%s' % stress_type,
                                             download_url)
+        if not aurl.is_url(self.download_url) and not os.path.isabs(self.download_url):
+            self.download_url = utils_misc.get_path(data_dir.DEPS_DIR, self.download_url)
         self.download_type = self.params.get('download_type_%s' % stress_type,
                                              download_type)
         self.base_name = self.download_url.split("/")[-1]
@@ -1920,7 +2106,8 @@ class Stress(object):
                                                        stress_type, dependency_packages))
         # dependency packages can be a list as well
         if self.dependency_packages:
-            self.dependency_packages = ast.literal_eval(self.dependency_packages)
+            self.dependency_packages = ast.literal_eval(
+                self.dependency_packages)
         self.downloaded_file_path = self.params.get("%s_downloaded_file_path" %
                                                     self.stress_type,
                                                     downloaded_file_path)
@@ -1941,7 +2128,8 @@ class Stress(object):
         self.install()
         self.cmd_output_safe('cd %s' % os.path.join(self.dst_path,
                                                     self.base_name, self.work_path))
-        launch_cmds = 'nohup %s %s > /dev/null &' % (self.stress_cmds, self.stress_args)
+        launch_cmds = 'nohup %s %s > /dev/null &' % (
+            self.stress_cmds, self.stress_args)
         logging.info("Launch stress with command: %s", launch_cmds)
         try:
             self.cmd_launch(launch_cmds)
@@ -2010,19 +2198,20 @@ class Stress(object):
         """
         Download stress tool
         """
-        url = self.download_url
-        tmp_path = data_dir.get_tmp_dir()
-        logging.info('Download stress tool from %s', url)
         # If it is git/wget based download proceed, else fall back if user already
         # have downloaded tool path, else raise
+        tmp_path = data_dir.get_tmp_dir()
         try:
-            download_method = getattr(self, "_%s_download" % self.download_type)
-            download_method(url, tmp_path)
+            download_method = getattr(
+                self, "_%s_download" % self.download_type)
+            logging.info('Download stress tool from %s', self.download_url)
+            download_method(self.download_url, tmp_path)
         except AttributeError:
             if not self.downloaded_file_path:
                 raise exceptions.TestError("Tool is not downloaded or download"
                                            " link for Tool is not provided")
-            file_type = process.getoutput("file %s" % self.downloaded_file_path)
+            file_type = process.getoutput(
+                "file %s" % self.downloaded_file_path)
             if "directory" not in file_type:
                 self.base_name = archive.uncompress(self.downloaded_file_path,
                                                     tmp_path)
@@ -2041,19 +2230,32 @@ class Stress(object):
                 logging.info('Copy stress tool to work dir of guest')
                 self.copy_files_to(source, self.dst_path)
             else:
-                self.dst_path = os.path.abspath(os.path.join(source, os.pardir))
+                self.dst_path = os.path.abspath(
+                    os.path.join(source, os.pardir))
 
     def install(self):
         """
         To download, abstract, build and install the stress tool
         """
-        self.download_stress()
         # Install the dependencies before the tool gets installed
         if self.dependency_packages:
             if not utils_package.package_install(self.dependency_packages,
                                                  session=self.session):
                 raise exceptions.TestError("Installing dependency packages for"
                                            " %s failed" % self.stress_type)
+        if self.stress_install_from_repo and self.stress_package:
+            # Install the stress package from existing repos
+            # If succeed, no need to download stress src any more
+            if not utils_package.package_install(self.stress_package,
+                                                 session=self.session):
+                self.stress_install_from_repo = False
+                logging.debug("Fail to install stress tool via repo and "
+                              "will download source to make and install it")
+            else:
+                logging.debug("Successful to install stress tool via repo")
+                return
+
+        self.download_stress()
         install_path = os.path.join(self.dst_path, self.base_name,
                                     self.work_path)
         self.make_cmds = "cd %s;%s" % (install_path, self.make_cmds)
@@ -2070,6 +2272,16 @@ class Stress(object):
         """
         Uninstall stress application, and clean the source files
         """
+        if self.stress_install_from_repo and self.stress_package:
+            # Uninstall the stress package from existing repos
+            # If succeed, no need to uninstall and remove source any more
+            if not utils_package.package_remove(self.stress_package,
+                                                session=self.session):
+                logging.debug("Fail to remove stress tool via repo and "
+                              "will continue to uninstall and remove source")
+            else:
+                logging.debug("Successful to remove stress tool via repo")
+                return
         install_path = os.path.join(self.dst_path, self.base_name)
         if self.cmd_status('cd %s' % install_path) != 0:
             logging.error("No source files found in path %s", path)
@@ -2318,26 +2530,192 @@ def unload_stress(stress_type, params, vms=None, remote_server=False):
                    remote_server=remote_server).unload_stress()
 
 
-def prepare_profile(test, fpath, pat_repl):
+class ServerClientStress(object):
     """
-    This is to prepare client profile to be run on client.
-    :param test: kvm test object
-    :param fpath: profile to be run
-    :param pat_repl: dict containing pattern and replacement : includes server_ip, duration, threads etc.
-    :return: no explicit return. But profile on fpath would be edited and ready to be run on client guest
-    :raise: TestError: raised if unable to edit the given profile
+    configure and run stress tools which needs server client setup
     """
-    try:
-        with open(fpath, 'r+') as profile_content:
-            tempstr = profile_content.read()
-            profile_content.truncate(0)
-            logging.debug("In prepare profile: pattern and replacement : %s", pat_repl)
-            for pattern, replace in pat_repl.items():
-                tempstr = tempstr.replace(pattern, replace)
-            profile_content.write(tempstr)
-        logging.debug("Profile xml to be run : %s ", tempstr)
-    except Exception:
-        test.error("Failed to update file : %s", fpath)
+
+    def __init__(self, params, env):
+        """
+        Set parameters for server client stress setup.
+        """
+
+        self.vms = env.get_all_vms()
+        self.stress_duration = int(params.get("stress_duration", "20"))
+        self.iptables_rule = params.get("iptables_rule", "")
+        self.stress_type = params.get("stress_type", "uperf")
+        self.need_profile = int(params.get("need_profile", False))
+        self.server_cmd = params.get("%s_server_cmd" % self.stress_type)
+        self.client_cmd = params.get("%s_client_cmd" % self.stress_type)
+        self.custom_pair = params.get("server_clients", "").split()
+        self.server_vms = []
+        self.client_vms = []
+        self.stress_vm = {}
+
+        if self.need_profile:
+            self.profile = params.get("client_profile_%s" % self.stress_type)
+            if not self.profile.endswith(".xml"):
+                raise exceptions.TestError(
+                    "%s profile not valid", self.stress_type)
+            self.profile = os.path.join(data_dir.get_root_dir(), self.profile)
+            self.profile_pattern = params.get("profile_pattern").split()
+        if not self.custom_pair:
+            self.client_vms = self.vms[0::2]
+            self.server_vms = self.vms[1::2]
+        else:
+            for pair in self.custom_pair:
+                for index, vm in enumerate(self.vms):
+                    if vm.name == pair.split("_")[0]:
+                        self.server_vms.append(vm)
+                    if vm.name == pair.split("_")[1]:
+                        self.client_vms.append(vm)
+        if (len(set(self.server_vms)) + len(set(self.client_vms))) != len(self.vms):
+            raise exceptions.TestError(
+                "Number of server client vms does not match total_vms")
+        elif len(self.server_vms) != len(self.client_vms):
+            raise exceptions.TestError(
+                "This test requires server and client vms in 1:1 ratio")
+        else:
+            self.pair_vms = zip(self.server_vms, self.client_vms)
+
+    def prepare_profile(self, fpath, pat_repl):
+        """
+        This is to prepare client profile to be run on client.
+
+        :param fpath: profile to be run
+        :param pat_repl: dict containing pattern and replacement : includes server_ip, duration, threads etc.
+        :return: no explicit return. But profile on fpath would be edited and ready to be run on client guest
+        :raise: TestError: raised if unable to edit the given profile
+        """
+        try:
+            with open(fpath, 'r+') as profile_content:
+                tempstr = profile_content.read()
+                profile_content.truncate(0)
+                logging.debug(
+                    "In prepare profile: pattern and replacement : %s", pat_repl)
+                for pattern, replace in pat_repl.items():
+                    tempstr = tempstr.replace(pattern, replace)
+                profile_content.write(tempstr)
+            logging.debug("Profile xml to be run : %s ", tempstr)
+        except Exception:
+            raise exceptions.TestError("Failed to update file : %s", fpath)
+
+    def load_stress(self, params):
+        """
+        This function can be called to load server client stress tools into
+        vms/baremetal hosts.
+
+        :param params: test params for stress tools
+        :return: Based on result of test would return True or False
+        :raise: TestError: raised if unable load stress tool or given input is incorrect
+        """
+
+        error = False
+        for server_vm, client_vm in self.pair_vms:
+            try:
+                params['stress_cmds_%s' % self.stress_type] = self.server_cmd
+                self.stress_vm[server_vm.name] = VMStress(
+                    server_vm, self.stress_type, params)
+                # wait so that guests get ip address, else get_address will
+                # fail
+                client_vm.wait_for_login().close()
+                server_vm.wait_for_login().close()
+                server_vm.params = params.object_params(server_vm.name)
+                client_vm.params = params.object_params(client_vm.name)
+                for vm in [server_vm, client_vm]:
+                    self.iptables_rule = vm.params.get("iptables_rule", "")
+                    if self.iptables_rule:
+                        params['server_pwd'] = vm.params.get("password")
+                        params['server_ip'] = vm.get_address()
+                        Iptables.setup_or_cleanup_iptables_rules(
+                            [self.iptables_rule], params=params, cleanup=False)
+                if not self.stress_vm[server_vm.name].app_running():
+                    self.stress_vm[server_vm.name].load_stress_tool()
+                if self.need_profile:
+                    profile_backup = self.profile + '.backup'
+                    shutil.copy(self.profile, profile_backup)
+                    self.pat_repl.update(
+                        {"serverip": str(server_vm.get_address())})
+                    self.prepare_profile(self.profile, self.pat_repl)
+                    client_vm.copy_files_to(self.profile, "/home", timeout=60)
+                    shutil.copy(profile_backup, self.profile)
+                    os.remove(profile_backup)
+                else:
+                    self.client_cmd = self.client_cmd.format(
+                        str(server_vm.get_address()))
+                params['stress_cmds_%s' % self.stress_type] = self.client_cmd
+                self.stress_vm[client_vm.name] = VMStress(
+                    client_vm, self.stress_type, params)
+                self.stress_vm[client_vm.name].load_stress_tool()
+            except exceptions.TestError as err_msg:
+                error = True
+                logging.error(err_msg)
+        return error
+
+    def verify_unload_stress(self, params):
+        """
+        This function will:
+        1. verify if the VMs are reachable after the stress tests
+        2. unloads stress in multiVMs
+        """
+        error = False
+        for vm in self.vms:
+            try:
+                s_ping, o_ping = utils_net.ping(
+                    vm.get_address(), count=10, timeout=20)
+                if s_ping != 0:
+                    error = True
+                    logging.error(
+                        "%s seem to have gone out of network", vm.name)
+                else:
+                    vm_params = params.object_params(vm.name)
+                    self.iptables_rule = vm_params.get("iptables_rule", "")
+                    self.stress_vm[vm.name].unload_stress()
+                    if self.iptables_rule:
+                        params['server_pwd'] = vm_params.get("password")
+                        params['server_ip'] = vm.get_address()
+                        logging.debug("server_ip: %s", vm.get_address())
+                        Iptables.setup_or_cleanup_iptables_rules(
+                            [self.iptables_rule], params=params, cleanup=True)
+                    self.stress_vm[vm.name].clean()
+                    vm.verify_dmesg()
+            except exceptions.TestError as err_msg:
+                error = True
+                logging.error(err_msg)
+
+        return error
+
+
+class UperfStressload(ServerClientStress):
+    """
+    configure Uperf type stress workload to run on multiVMs
+    """
+
+    def __init__(self, params, env):
+        super(UperfStressload, self).__init__(params, env)
+        protocol = params.get("%s_protocol" % self.stress_type, "tcp")
+        nthreads = params.get("nthreads", "32")
+        self.client_cmd = self.client_cmd % os.path.basename(self.profile)
+        self.profile_values = [nthreads, str(self.stress_duration), protocol]
+        if len(self.profile_pattern) != len(self.profile_values):
+            raise exceptions.TestError(
+                "Profile patterns not matching values passed: fix the cfg file with right pattern")
+        self.profile_pattern.append('serverip')
+        self.pat_repl = dict(zip(self.profile_pattern, self.profile_values))
+
+
+class NetperfStressload(ServerClientStress):
+    """
+    configure Netperf type stress workload to run on multiVMs
+    """
+
+    def __init__(self, params, env):
+        super(NetperfStressload, self).__init__(params, env)
+        ports = params.get("ports", "16604")
+        test_protocol = params.get("test_protocols", "TCP_STREAM")
+        self.server_cmd = self.server_cmd.format(ports)
+        self.client_cmd = self.client_cmd.format(
+            "{0}", ports, self.stress_duration, test_protocol)
 
 
 class RemoteDiskManager(object):
@@ -2547,7 +2925,7 @@ class RemoteVMManager(object):
                                           password=self.remote_pwd)
 
     def setup_ssh_auth(self, vm_ip, vm_pwd, vm_user="root",
-                       port=22, timeout=10):
+                       port=22, timeout=20):
         """
         Setup SSH passwordless access between remote host
         and VM, which is on the remote host.
@@ -2573,7 +2951,7 @@ class RemoteVMManager(object):
                             r"lost connection", r"]#"]
             try:
                 index, text = session.read_until_last_line_matches(
-                    matched_strs, timeout=20,
+                    matched_strs, timeout=timeout,
                     internal_timeout=0.5)
             except (aexpect.ExpectTimeoutError,
                     aexpect.ExpectProcessTerminatedError) as e:

@@ -12,6 +12,7 @@ import random
 import select
 import socket
 import time
+import struct
 
 import aexpect
 
@@ -44,7 +45,7 @@ class _VirtioPort(object):
     Define structure to keep information about used port.
     """
 
-    def __init__(self, qemu_id, name, hostfile):
+    def __init__(self, qemu_id, name, hostfile, port_type="unix_socket"):
         """
         :param name: Name of port for guest side.
         :param hostfile: Path to port on host side.
@@ -55,6 +56,7 @@ class _VirtioPort(object):
         self.is_console = None  # "yes", "no"
         self.sock = None
         self.port_was_opened = None
+        self.port_type = port_type
 
     def __str__(self):
         """
@@ -97,8 +99,15 @@ class _VirtioPort(object):
         attempt = 11
         while attempt > 0:
             try:
-                self.sock = socket.socket(socket.AF_UNIX,
-                                          socket.SOCK_STREAM)
+                if self.port_type == 'unix_socket':
+                    sock_flag = socket.AF_UNIX
+                elif self.port_type in ('tcp_socket', 'udp'):
+                    sock_flag = socket.AF_INET
+                if self.port_type == 'udp':
+                    sock_type = socket.SOCK_DGRAM
+                elif self.port_type in ('tcp_socket', 'unix_socket'):
+                    sock_type = socket.SOCK_STREAM
+                self.sock = socket.socket(sock_flag, sock_type)
                 self.sock.settimeout(1)
                 self.sock.connect(self.hostfile)
                 self.sock.setsockopt(1, socket.SO_SNDBUF, SOCKET_SIZE)
@@ -127,7 +136,7 @@ class _VirtioPort(object):
         ret = select.select([self.sock], [], [], 1.0)
         if ret[0]:
             buf = self.sock.recv(1024)
-            logging.debug("Rest in socket: " + buf)
+            logging.debug("Rest in socket: " + repr(buf))
 
     def close(self):
         """
@@ -149,12 +158,12 @@ class VirtioSerial(_VirtioPort):
 
     """ Class for handling virtio-serialport """
 
-    def __init__(self, qemu_id, name, hostfile):
+    def __init__(self, qemu_id, name, hostfile, port_type="unix_socket"):
         """
         :param name: Name of port for guest side.
         :param hostfile: Path to port on host side.
         """
-        super(VirtioSerial, self).__init__(qemu_id, name, hostfile)
+        super(VirtioSerial, self).__init__(qemu_id, name, hostfile, port_type)
         self.is_console = "no"
 
 
@@ -162,12 +171,12 @@ class VirtioConsole(_VirtioPort):
 
     """ Class for handling virtio-console """
 
-    def __init__(self, qemu_id, name, hostfile):
+    def __init__(self, qemu_id, name, hostfile, port_type="unix_socket"):
         """
         :param name: Name of port for guest side.
         :param hostfile: Path to port on host side.
         """
-        super(VirtioConsole, self).__init__(qemu_id, name, hostfile)
+        super(VirtioConsole, self).__init__(qemu_id, name, hostfile, port_type)
         self.is_console = "yes"
 
 
@@ -379,7 +388,7 @@ class GuestWorker(object):
                 try:
                     timeout = send_pt.sock.gettimeout()
                     send_pt.sock.settimeout(1)
-                    send_pt.sock.send(".")
+                    send_pt.sock.send(b".")
                 except socket.timeout:
                     pass    # If still stuck VM gets destroyed below
                 send_pt.sock.settimeout(timeout)
@@ -394,8 +403,8 @@ class GuestWorker(object):
                 recv_pt.sock.recv(1024)
 
         # This will cause fail in case anything went wrong.
-        match, tmp = self._cmd("print 'PASS: nothing'", 10, ('^PASS: nothing',
-                                                             '^FAIL:'))
+        match, tmp = self._cmd("print('PASS: nothing')", 10, ('^PASS: nothing',
+                                                              '^FAIL:'))
         if match is not 0:
             logging.error("Python is stuck/FAILed after read-out:\n%s", tmp)
             try:
@@ -584,9 +593,9 @@ class ThSendCheck(Thread):
             if ret[1]:
                 # Generate blocklen of random data add them to the FIFO
                 # and send them over virtio_console
-                buf = ""
+                buf = b""
                 for _ in range(self.blocklen):
-                    char = "%c" % random.randrange(rand_a, rand_b)
+                    char = b"%c" % random.randrange(rand_a, rand_b)
                     buf += char
                     for queue in self.queues:
                         queue.append(char)
@@ -787,7 +796,8 @@ class ThRecvCheck(Thread):
                     continue
                 if buf:
                     # Compare the received data with the control data
-                    for char in buf:
+                    for char in bytearray(buf):
+                        char = struct.pack('B', char)
                         _char = self.buff.popleft()
                         if char == _char:
                             self.idx += 1
@@ -813,10 +823,10 @@ class ThRecvCheck(Thread):
                                                   self.getName(), repr(buf))
                                     # sender might change the buff :-(
                                     time.sleep(1)
-                                    _char = ""
+                                    _char = b""
                                     for buf in self.buff:
                                         _char += buf
-                                        _char += ' '
+                                        _char += b' '
                                     logging.error("ThRecvCheck %s: "
                                                   "Queue = %s",
                                                   self.getName(), repr(_char))
@@ -884,7 +894,8 @@ class ThRecvCheck(Thread):
                     # Compare the received data with the control data
                     for idx_char in xrange(len(buf)):
                         _char = self.buff.popleft()
-                        if buf[idx_char] == _char:
+                        char = struct.pack('B', (bytearray(buf)[idx_char]))
+                        if char == _char:
                             self.idx += 1
                             verif_buf.append(_char)
                         else:

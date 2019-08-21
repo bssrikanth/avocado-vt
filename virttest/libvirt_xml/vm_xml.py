@@ -72,6 +72,10 @@ class VMXMLBase(base.LibvirtXMLBase):
             get: return text value of uuid tag
             set: set text value for (new) uuid tag (unvalidated)
             del: remove uuid tag
+        title: string, a short description of vm
+            get: return text value of title tag
+            set: set text value for title tag
+            del: remove title tag
         vcpu, memory, max_mem, current_mem, iothreads: integers
             get: returns integer
             set: set integer
@@ -159,13 +163,13 @@ class VMXMLBase(base.LibvirtXMLBase):
     """
 
     # Additional names of attributes and dictionary-keys instances may contain
-    __slots__ = ('hypervisor_type', 'vm_name', 'uuid', 'vcpu', 'max_mem',
+    __slots__ = ('hypervisor_type', 'vm_name', 'uuid', 'title', 'vcpu', 'max_mem',
                  'current_mem', 'dumpcore', 'numa_memory', 'numa_memnode',
                  'devices', 'seclabel', 'cputune', 'placement', 'cpuset',
                  'current_vcpu', 'vcpus', 'os', 'cpu', 'pm', 'on_poweroff',
                  'on_reboot', 'on_crash', 'features', 'mb', 'max_mem_unit',
                  'current_mem_unit', 'memtune', 'max_mem_rt', 'max_mem_rt_unit',
-                 'max_mem_rt_slots', 'iothreads', 'iothreadids', 'memory')
+                 'max_mem_rt_slots', 'iothreads', 'iothreadids', 'memory', 'perf')
 
     __uncompareable__ = base.LibvirtXMLBase.__uncompareable__
 
@@ -188,6 +192,11 @@ class VMXMLBase(base.LibvirtXMLBase):
                                  forbidden=None,
                                  parent_xpath='/',
                                  tag_name='uuid')
+        accessors.XMLElementText(property_name="title",
+                                 libvirtxml=self,
+                                 forbidden=None,
+                                 parent_xpath='/',
+                                 tag_name='title')
         accessors.XMLElementInt(property_name="iothreads",
                                 libvirtxml=self,
                                 forbidden=None,
@@ -284,6 +293,13 @@ class VMXMLBase(base.LibvirtXMLBase):
                                  parent_xpath='numatune',
                                  marshal_from=self.marshal_from_memnode,
                                  marshal_to=self.marshal_to_memnode)
+        accessors.XMLElementNest(property_name="perf",
+                                 libvirtxml=self,
+                                 parent_xpath='/',
+                                 tag_name='perf',
+                                 subclass=VMPerfXML,
+                                 subclass_dargs={
+                                     'virsh_instance': virsh_instance})
         accessors.XMLElementNest(property_name='cputune',
                                  libvirtxml=self,
                                  parent_xpath='/',
@@ -538,20 +554,29 @@ class VMXMLBase(base.LibvirtXMLBase):
 
         :return: None if deleting all controllers
         """
-        all_controllers = self.xmltreefile.findall("devices/controller")
-        del_controllers = []
-        for controller in all_controllers:
-            if controller.get("type") != controller_type:
-                continue
-            del_controllers.append(controller)
-
         # no seclabel tag found in xml.
+        del_controllers = self.get_controllers(controller_type=controller_type)
         if del_controllers == []:
             logging.debug("Controller %s for this domain does not "
                           "exist" % controller_type)
 
         for controller in del_controllers:
             self.xmltreefile.remove(controller)
+
+    def get_controllers(self, controller_type=None):
+        """
+        Get controllers according controller type
+
+        :param controller_type: type of controllers need to get
+        :return: controller list
+        """
+        all_controllers = self.xmltreefile.findall("devices/controller")
+        type_controllers = []
+        for controller in all_controllers:
+            if controller.get("type") != controller_type:
+                continue
+            type_controllers.append(controller)
+        return type_controllers
 
 
 class VMXML(VMXMLBase):
@@ -719,7 +744,7 @@ class VMXML(VMXMLBase):
     @staticmethod
     def set_vm_vcpus(vm_name, vcpus, current=None, sockets=None, cores=None,
                      threads=None, add_topology=False, topology_correction=False,
-                     virsh_instance=base.virsh):
+                     update_numa=True, virsh_instance=base.virsh):
         """
         Convenience method for updating 'vcpu', 'current' and
         'cpu topology' attribute property with of a defined VM
@@ -732,6 +757,7 @@ class VMXML(VMXMLBase):
         :param threads: number of threads, default None
         :param add_topology: True to add new topology definition if not present
         :param topology_correction: Correct topology if wrong already
+        :param update_numa: Update numa
         :parma virsh_instance: virsh instance
         """
         vmxml = VMXML.new_from_dumpxml(vm_name, virsh_instance=virsh_instance)
@@ -772,6 +798,36 @@ class VMXML(VMXMLBase):
                                          'cores': cores,
                                          'threads': threads}
                 vmxml['cpu'] = vmcpu_xml
+            try:
+                vmcpu_xml = vmxml['cpu']
+                if update_numa and vmxml.cpu.numa_cell:
+                    no_numa_cell = len(vmxml.cpu.numa_cell)
+                    if vcpus >= no_numa_cell:
+                        vcpus_num = vcpus // no_numa_cell
+                        vcpu_rem = vcpus % no_numa_cell
+                        index = 0
+                        nodexml_list = []
+                        for node in range(no_numa_cell):
+                            nodexml = vmcpu_xml.numa_cell[node]
+                            if vcpus_num > 1:
+                                if (node == no_numa_cell - 1) and vcpu_rem > 0:
+                                    nodexml["cpus"] = "%s-%s" % (index, index + vcpus_num + vcpu_rem - 1)
+                                else:
+                                    nodexml["cpus"] = "%s-%s" % (index, index + vcpus_num - 1)
+                            else:
+                                if (node == no_numa_cell - 1) and vcpu_rem > 0:
+                                    nodexml["cpus"] = str(index + vcpu_rem)
+                                else:
+                                    nodexml["cpus"] = str(index)
+                            index = vcpus_num * (node + 1)
+                            nodexml_list.append(nodexml)
+                        vmcpu_xml.set_numa_cell(nodexml_list)
+                    else:
+                        logging.warning("Guest numa could not be updated, expect "
+                                        "failures if guest numa is checked")
+                vmxml['cpu'] = vmcpu_xml
+            except xcepts.LibvirtXMLNotFoundError:
+                pass
             vmxml['vcpu'] = vcpus  # call accessor method to change XML
         else:  # value is None
             del vmxml.vcpu
@@ -1293,18 +1349,20 @@ class VMXML(VMXMLBase):
         vmxml['cpu'] = cpuxml
         vmxml.sync()
 
-    def add_device(self, value):
+    def add_device(self, value, allow_dup=False):
         """
         Add a device into VMXML.
 
         :param value: instance of device in libvirt_xml/devices/
+        :param allow_dup: Boolean value. True for allow to add duplicated devices
         """
         devices = self.get_devices()
-        for device in devices:
-            if device == value:
-                logging.debug("Device %s is already in VM %s.",
-                              value, self.vm_name)
-                return
+        if not allow_dup:
+            for device in devices:
+                if device == value:
+                    logging.debug("Device %s is already in VM %s.",
+                                  value, self.vm_name)
+                    return
         devices.append(value)
         self.set_devices(devices)
 
@@ -1416,7 +1474,7 @@ class VMXML(VMXMLBase):
         """
         dev = self.get_device_class('hostdev')()
         dev.mode = mode
-        dev.hostdev_type = hostdev_type
+        dev.type = hostdev_type
         dev.managed = managed
         if boot_order:
             dev.boot_order = boot_order
@@ -1553,6 +1611,29 @@ class VMXML(VMXMLBase):
         Remove all disk devices.
         """
         self.remove_all_device_by_type('disk')
+
+    @staticmethod
+    def set_vm_features(vm_name, **attrs):
+        """
+        Set attrs of vm features xml
+
+        :param vm_name: The name of vm to be set
+        :param attrs: attributes to be set
+        """
+        vmxml = VMXML.new_from_inactive_dumpxml(vm_name)
+        if vmxml.xmltreefile.find('/features'):
+            features_xml = vmxml.features
+        else:
+            features_xml = VMFeaturesXML()
+        try:
+            for attr_key, value in attrs.items():
+                setattr(features_xml, attr_key, value)
+            logging.debug('New features_xml: %s', features_xml)
+            vmxml.features = features_xml
+            vmxml.sync()
+        except (AttributeError, TypeError, ValueError) as detail:
+            raise xcepts.LibvirtXMLError(
+                "Invalid feature tag or attribute: %s" % detail)
 
 
 class VMCPUXML(base.LibvirtXMLBase):
@@ -1995,7 +2076,7 @@ class VMOSXML(base.LibvirtXMLBase):
         type:         text attributes - arch, machine
         loader:       path
         boots:        list attributes - dev
-        bootmenu:          attributes - enable
+        bootmenu:          attributes - enable, timeout
         smbios:            attributes - mode
         bios:              attributes - useserial, rebootTimeout
         init:         text
@@ -2013,7 +2094,7 @@ class VMOSXML(base.LibvirtXMLBase):
                  'smbios_mode', 'bios_useserial', 'bios_reboot_timeout', 'init',
                  'bootloader', 'bootloader_args', 'kernel', 'initrd', 'cmdline',
                  'dtb', 'initargs', 'loader_readonly', 'loader_type', 'nvram',
-                 'nvram_template', 'secure')
+                 'nvram_template', 'secure', 'bootmenu_timeout')
 
     def __init__(self, virsh_instance=base.virsh):
         accessors.XMLElementText('type', self, parent_xpath='/',
@@ -2029,6 +2110,8 @@ class VMOSXML(base.LibvirtXMLBase):
                                  marshal_to=self.marshal_to_boots)
         accessors.XMLAttribute('bootmenu_enable', self, parent_xpath='/',
                                tag_name='bootmenu', attribute='enable')
+        accessors.XMLAttribute('bootmenu_timeout', self, parent_xpath='/',
+                               tag_name='bootmenu', attribute='timeout')
         accessors.XMLAttribute('smbios_mode', self, parent_xpath='/',
                                tag_name='smbios', attribute='mode')
         accessors.XMLAttribute('bios_useserial', self, parent_xpath='/',
@@ -2116,12 +2199,15 @@ class VMFeaturesXML(base.LibvirtXMLBase):
         hyperv_spinlocks:  attributes - state, retries
         kvm_hidden:        attribute - state
         pvspinlock:        attribute - state
+        smm:               attribute - state
     """
 
     __slots__ = ('feature_list', 'hyperv_relaxed_state', 'hyperv_vapic_state',
                  'hyperv_spinlocks_state', 'hyperv_spinlocks_retries',
-                 'kvm_hidden_state', 'pvspinlock_state', 'smm', 'hpt_resizing',
-                 'htm')
+                 'hyperv_tlbflush_state', 'hyperv_frequencies_state',
+                 'hyperv_reenlightenment_state', 'hyperv_vpindex_state',
+                 'kvm_hidden_state', 'pvspinlock_state', 'smm', 'hpt',
+                 'htm', 'smm_tseg_unit', 'smm_tseg', 'nested_hv')
 
     def __init__(self, virsh_instance=base.virsh):
         accessors.XMLAttribute(property_name='hyperv_relaxed_state',
@@ -2144,6 +2230,26 @@ class VMFeaturesXML(base.LibvirtXMLBase):
                                parent_xpath='/hyperv',
                                tag_name='spinlocks',
                                attribute='retries')
+        accessors.XMLAttribute(property_name='hyperv_vpindex_state',
+                               libvirtxml=self,
+                               parent_xpath='/hyperv',
+                               tag_name='vpindex',
+                               attribute='state')
+        accessors.XMLAttribute(property_name='hyperv_tlbflush_state',
+                               libvirtxml=self,
+                               parent_xpath='/hyperv',
+                               tag_name='tlbflush',
+                               attribute='state')
+        accessors.XMLAttribute(property_name='hyperv_frequencies_state',
+                               libvirtxml=self,
+                               parent_xpath='/hyperv',
+                               tag_name='frequencies',
+                               attribute='state')
+        accessors.XMLAttribute(property_name='hyperv_reenlightenment_state',
+                               libvirtxml=self,
+                               parent_xpath='/hyperv',
+                               tag_name='reenlightenment',
+                               attribute='state')
         accessors.XMLAttribute(property_name='kvm_hidden_state',
                                libvirtxml=self,
                                parent_xpath='/kvm',
@@ -2159,11 +2265,25 @@ class VMFeaturesXML(base.LibvirtXMLBase):
                                parent_xpath='/',
                                tag_name='smm',
                                attribute='state')
-        accessors.XMLAttribute(property_name='hpt_resizing',
+        accessors.XMLAttribute(property_name='smm_tseg_unit',
+                               libvirtxml=self,
+                               parent_xpath='/smm',
+                               tag_name='tseg',
+                               attribute='unit')
+        accessors.XMLAttribute(property_name='nested_hv',
                                libvirtxml=self,
                                parent_xpath='/',
-                               tag_name='hpt',
-                               attribute='resizing')
+                               tag_name='nested-hv',
+                               attribute='state')
+        accessors.XMLElementText('smm_tseg', self, parent_xpath='/smm',
+                                 tag_name='tseg')
+        accessors.XMLElementNest(property_name='hpt',
+                                 libvirtxml=self,
+                                 parent_xpath='/',
+                                 tag_name='hpt',
+                                 subclass=VMFeaturesHptXML,
+                                 subclass_dargs={
+                                     'virsh_instance': virsh_instance})
         accessors.XMLAttribute(property_name='htm',
                                libvirtxml=self,
                                parent_xpath='/',
@@ -2348,9 +2468,13 @@ class VMMemBackingXML(VMXML):
         hugepages
         nosharepages
         locked
+        source
+        access
+        discard
     """
 
-    __slots__ = ('hugepages', 'nosharepages', 'locked')
+    __slots__ = ('hugepages', 'nosharepages', 'locked', 'source', 'access',
+                 'discard', 'source_type', 'access_mode')
 
     def __init__(self, virsh_instance=base.virsh):
         accessors.XMLElementNest(property_name='hugepages',
@@ -2360,9 +2484,23 @@ class VMMemBackingXML(VMXML):
                                  subclass=VMHugepagesXML,
                                  subclass_dargs={
                                      'virsh_instance': virsh_instance})
-        for slot in ('nosharepages', 'locked'):
+        for slot in ('nosharepages', 'locked', 'discard'):
             accessors.XMLElementBool(slot, self, parent_xpath='/',
                                      tag_name=slot)
+        accessors.XMLElementText('source', self, parent_xpath='/',
+                                 tag_name='source')
+        accessors.XMLAttribute(property_name="source_type",
+                               libvirtxml=self,
+                               parent_xpath='/',
+                               tag_name='source',
+                               attribute='type')
+        accessors.XMLElementText('access', self, parent_xpath='/',
+                                 tag_name='access')
+        accessors.XMLAttribute(property_name="access_mode",
+                               libvirtxml=self,
+                               parent_xpath='/',
+                               tag_name='access',
+                               attribute='mode')
         super(VMMemBackingXML, self).__init__(virsh_instance=virsh_instance)
         self.xml = '<memoryBacking/>'
 
@@ -2428,6 +2566,86 @@ class VMMemTuneXML(base.LibvirtXMLBase):
         self.xml = '<memtune/>'
 
 
+class VMPerfXML(VMXML):
+
+    """
+    perf tag XML class
+
+    Properties:
+        event :
+            dict, keys: name, enabled
+    """
+
+    __slots__ = ('events',)
+
+    def __init__(self, virsh_instance=base.virsh):
+        accessors.XMLElementList('events', self, forbidden=[],
+                                 parent_xpath='/',
+                                 marshal_from=self.marshal_from_event,
+                                 marshal_to=self.marshal_to_event)
+
+        super(VMPerfXML, self).__init__(virsh_instance=virsh_instance)
+        self.xml = '<perf/>'
+
+    # Sub-element of perf
+    class EventXML(VMXML):
+
+        """Event element of perf"""
+
+        __slots__ = ('name', 'enabled')
+
+        def __init__(self, virsh_instance=base.virsh):
+            """
+            Create new EventXML instance
+            """
+            accessors.XMLAttribute(property_name="name",
+                                   libvirtxml=self,
+                                   forbidden=[],
+                                   parent_xpath='/perf',
+                                   tag_name='event',
+                                   attribute='name')
+            accessors.XMLAttribute(property_name="enabled",
+                                   libvirtxml=self,
+                                   forbidden=[],
+                                   parent_xpath='/perf',
+                                   tag_name='event',
+                                   attribute='enabled')
+            super(VMPerfXML.EventXML, self).__init__(
+                virsh_instance=virsh_instance)
+
+        def update(self, attr_dict):
+            for attr, value in list(attr_dict.items()):
+                setattr(self, attr, value)
+
+    @staticmethod
+    def marshal_from_event(item, index, libvirtxml):
+        """
+        Convert a EventXML instance to tag and attributes
+        """
+        del index
+        del libvirtxml
+
+        event = item.xmltreefile.find("/perf/event")
+        try:
+            return (event.tag, dict(list(event.items())))
+        except AttributeError:  # Didn't find event
+            raise xcepts.LibvirtXMLError("Expected a list of event "
+                                         "instances, not a %s" % str(item))
+
+    @staticmethod
+    def marshal_to_event(tag, attr_dict, index, libvirtxml):
+        """
+        Convert a tag and attributes to a EventXML instance
+        """
+        del index
+        if tag == 'event':
+            newone = VMPerfXML.EventXML(virsh_instance=libvirtxml.virsh)
+            newone.update(attr_dict)
+            return newone
+        else:
+            return None
+
+
 class VMIothreadidsXML(VMXML):
 
     """
@@ -2465,3 +2683,39 @@ class VMIothreadidsXML(VMXML):
         if tag != 'iothread':
             return None
         return attr_dict['id']
+
+
+class VMFeaturesHptXML(base.LibvirtXMLBase):
+
+    """
+    Hpt tag XML class of features tag
+
+    Element:
+        resizing:               text
+        maxpagesize_unit:       attribute
+        maxpagesize:            int
+    Example:
+        <hpt resizing="required">
+            <maxpagesize unit="KiB">64</maxpagesize>
+        </hpt>
+    """
+
+    __slots__ = ('resizing', 'maxpagesize_unit', 'maxpagesize')
+
+    def __init__(self, virsh_instance=base.virsh):
+        accessors.XMLAttribute(property_name="resizing",
+                               libvirtxml=self,
+                               parent_xpath='/',
+                               tag_name='hpt',
+                               attribute='resizing')
+        accessors.XMLElementInt(property_name='maxpagesize',
+                                libvirtxml=self,
+                                parent_xpath='/',
+                                tag_name='maxpagesize')
+        accessors.XMLAttribute(property_name="maxpagesize_unit",
+                               libvirtxml=self,
+                               parent_xpath='/',
+                               tag_name='maxpagesize',
+                               attribute='unit')
+        super(VMFeaturesHptXML, self).__init__(virsh_instance=virsh_instance)
+        self.xml = '<hpt/>'

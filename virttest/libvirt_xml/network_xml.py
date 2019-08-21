@@ -61,7 +61,7 @@ class IPXML(base.LibvirtXMLBase):
                  'family', 'prefix', 'tftp_root', 'dhcp_bootp')
 
     def __init__(self, address='192.168.122.1', netmask='255.255.255.0',
-                 virsh_instance=base.virsh):
+                 ipv6=False, virsh_instance=base.virsh):
         """
         Create new IPXML instance based on address/mask
         """
@@ -90,7 +90,10 @@ class IPXML(base.LibvirtXMLBase):
                                  marshal_from=self.marshal_from_host,
                                  marshal_to=self.marshal_to_host)
         super(IPXML, self).__init__(virsh_instance=virsh_instance)
-        self.xml = u"<ip address='%s' netmask='%s'></ip>" % (address, netmask)
+        if ipv6:
+            self.xml = u"<ip address='%s'></ip>" % address
+        else:
+            self.xml = u"<ip address='%s' netmask='%s'></ip>" % (address, netmask)
 
     @staticmethod
     def marshal_from_host(item, index, libvirtxml):
@@ -375,7 +378,7 @@ class NetworkXMLBase(base.LibvirtXMLBase):
                  'bandwidth_inbound', 'bandwidth_outbound', 'portgroup',
                  'dns', 'domain_name', 'nat_port', 'forward_interface',
                  'routes', 'virtualport_type', 'vf_list', 'driver', 'pf',
-                 'mtu')
+                 'mtu', 'connection')
 
     __uncompareable__ = base.LibvirtXMLBase.__uncompareable__ + (
         'defined', 'active',
@@ -384,6 +387,8 @@ class NetworkXMLBase(base.LibvirtXMLBase):
     __schema_name__ = "network"
 
     def __init__(self, virsh_instance=base.virsh):
+        accessors.XMLAttribute('connection', self, parent_xpath='/',
+                               tag_name='network', attribute='connections')
         accessors.XMLElementText('name', self, parent_xpath='/',
                                  tag_name='name')
         accessors.XMLElementText('uuid', self, parent_xpath='/',
@@ -485,10 +490,12 @@ class NetworkXMLBase(base.LibvirtXMLBase):
 
     def get_active(self):
         """Accessor method for 'active' property (True/False)"""
-        self.__check_undefined__("Cannot determine activation for undefined "
-                                 "network")
         state_dict = self.virsh.net_state_dict(virsh_instance=self.virsh)
-        return state_dict[self.name]['active']
+        try:
+            active_state = state_dict[self.name]['active']
+        except KeyError:
+            return False
+        return active_state
 
     def set_active(self, value):
         """Accessor method for 'active' property, sets network active"""
@@ -509,7 +516,6 @@ class NetworkXMLBase(base.LibvirtXMLBase):
 
     def del_active(self):
         """Accessor method for 'active' property, stops network"""
-        self.__check_undefined__("Cannot deactivate undefined network")
         if self.active:
             self.virsh.net_destroy(self.name)
         else:
@@ -580,6 +586,23 @@ class NetworkXMLBase(base.LibvirtXMLBase):
             xmltreefile.remove(element)
             xmltreefile.write()
 
+    def del_element(self, element='', index=0):
+        """
+        Delete element from network xml
+
+        :param element: xpath of element like '/ip/dhcp'
+        :param index: index of element that want to delete
+        """
+        xmltreefile = self.__dict_get__('xml')
+        try:
+            del_elem = xmltreefile.findall(element)[index]
+        except IndexError as detail:
+            del_elem = None
+            logging.warning(detail)
+        if del_elem is not None:
+            xmltreefile.remove(del_elem)
+            xmltreefile.write()
+
     def get_portgroup(self):
         try:
             portgroup_root = self.xmltreefile.reroot('/portgroup')
@@ -602,6 +625,19 @@ class NetworkXMLBase(base.LibvirtXMLBase):
         if element is not None:
             self.xmltreefile.remove(element)
             self.xmltreefile.write()
+
+    def get_interface_connection(self):
+        try:
+            ifaces = self.xmltreefile.findall("/forward/interface")
+        except KeyError as detail:
+            raise xcepts.LibvirtXMLError(detail)
+        iface_conn = []
+        for iface in ifaces:
+            try:
+                iface_conn.append(iface.get("connections"))
+            except KeyError:
+                pass
+        return iface_conn
 
     def new_dns(self, **dargs):
         """
@@ -789,7 +825,7 @@ class NetworkXML(NetworkXMLBase):
         """
         Start network with self.virsh.
         """
-        cmd_result = self.virsh.net_start(self.name)
+        cmd_result = self.virsh.net_start(self.name, debug=True)
         if cmd_result.exit_status:
             raise xcepts.LibvirtXMLError("Failed to start network %s.\n"
                                          "Detail: %s" %

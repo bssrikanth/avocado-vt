@@ -16,6 +16,7 @@
 Avocado VT plugin
 """
 
+import argparse
 import copy
 import logging
 import os
@@ -30,6 +31,14 @@ from virttest import storage
 
 from .options import VirtTestOptionsProcess
 from .test import VirtTest
+
+
+if hasattr(loader, "DiscoverMode"):
+    LOADER_DEFAULT = loader.DiscoverMode.DEFAULT
+    LOADER_ALL = loader.DiscoverMode.ALL
+else:
+    LOADER_DEFAULT = loader.DEFAULT
+    LOADER_ALL = loader.ALL
 
 
 LOG = logging.getLogger("avocado.app")
@@ -95,12 +104,15 @@ class VirtTestLoader(loader.TestLoader):
            of this plugins "self.args" (extends the --vt-extra-params)
         """
         vt_extra_params = extra_params.pop("avocado_vt_extra_params", None)
+        # Compatibility with nrunner Avocado
+        if isinstance(args, dict):
+            args = argparse.Namespace(**args)
         super(VirtTestLoader, self).__init__(args, extra_params)
         self._fill_optional_args()
         if vt_extra_params:
             # We don't want to override the original args
             self.args = copy.deepcopy(self.args)
-            if self.args.vt_extra_params is not None:
+            if getattr(self.args, 'vt_extra_params', None) is not None:
                 self.args.vt_extra_params += vt_extra_params
             else:
                 self.args.vt_extra_params = vt_extra_params
@@ -179,12 +191,12 @@ class VirtTestLoader(loader.TestLoader):
 
     @staticmethod
     def _report_bad_discovery(name, reason, which_tests):
-        if which_tests is loader.ALL:
+        if which_tests is LOADER_ALL:
             return [(NotAvocadoVTTest, {"name": "%s: %s" % (name, reason)})]
         else:
             return []
 
-    def discover(self, url, which_tests=loader.DEFAULT):
+    def discover(self, url, which_tests=LOADER_DEFAULT):
         try:
             cartesian_parser = self._get_parser()
         except Exception as details:
@@ -199,7 +211,7 @@ class VirtTestLoader(loader.TestLoader):
             # the other test plugins to handle the URL.
             except cartesian_config.ParserError as details:
                 return self._report_bad_discovery(url, details, which_tests)
-        elif which_tests is loader.DEFAULT and not self.args.vt_config:
+        elif which_tests is LOADER_DEFAULT and not self.args.vt_config:
             # By default don't run anythinig unless vt_config provided
             return []
         # Create test_suite
@@ -223,7 +235,7 @@ class VirtTestLoader(loader.TestLoader):
             test_parameters = {'name': test_name,
                                'vt_params': params}
             test_suite.append((VirtTest, test_parameters))
-        if which_tests is loader.ALL and not test_suite:
+        if which_tests is LOADER_ALL and not test_suite:
             return self._report_bad_discovery(url, "No matching tests",
                                               which_tests)
         return test_suite

@@ -32,6 +32,7 @@ from virttest import test_setup
 from virttest import virt_vm
 from virttest import utils_misc
 from virttest import storage
+from virttest import utils_libguestfs
 from virttest import qemu_storage
 from virttest import utils_libvirtd
 from virttest import remote
@@ -39,9 +40,12 @@ from virttest import data_dir
 from virttest import utils_net
 from virttest import nfs
 from virttest import libvirt_vm
+from virttest import virsh
 from virttest import utils_test
+from virttest import utils_iptables
 from virttest.utils_version import VersionInterval
 from virttest.compat_52lts import decode_to_text
+from virttest.staging import service
 
 try:
     import PIL.Image
@@ -59,6 +63,10 @@ _vm_register_thread_termination_event = None
 
 _setup_manager = test_setup.SetupManager()
 
+# default num of surplus hugepage, order to compare the values before and after
+# the test when 'setup_hugepages = yes'
+_pre_hugepages_surp = 0
+_post_hugepages_surp = 0
 
 #: QEMU version regex.  Attempts to extract the simple and extended version
 #: information from the output produced by `qemu -version`
@@ -204,6 +212,36 @@ def preprocess_vm(test, params, env, name):
                           migration_mode=params.get("migration_mode"),
                           migration_fd=params.get("migration_fd"),
                           migration_exec_cmd=params.get("migration_exec_cmd_dst"))
+
+        # Update kernel param
+        kernel_extra_params_add = params.get("kernel_extra_params_add", "")
+        kernel_extra_params_remove = params.get("kernel_extra_params_remove", "")
+        if params.get("disable_pci_msi"):
+            disable_pci_msi = params.get("disable_pci_msi")
+            if disable_pci_msi == "yes":
+                if "pci=" in kernel_extra_params_add:
+                    kernel_extra_params_add = re.sub("pci=.*?\s+", "pci=nomsi ",
+                                                     kernel_extra_params_add)
+                else:
+                    kernel_extra_params_add += " pci=nomsi"
+                params["ker_remove_similar_pci"] = "yes"
+            else:
+                kernel_extra_params_remove += " pci=nomsi"
+        if (params.get("enable_guest_iommu") and
+                utils_misc.get_cpu_vendor(verbose=False) == 'GenuineIntel'):
+            enable_guest_iommu = params.get("enable_guest_iommu")
+            if enable_guest_iommu == "yes":
+                kernel_extra_params_add += " intel_iommu=on"
+            else:
+                kernel_extra_params_remove += " intel_iommu=on"
+            guest_iommu_option = params.get("guest_iommu_option")
+            if guest_iommu_option:
+                kernel_extra_params_add += " iommu=%s" % guest_iommu_option
+        if kernel_extra_params_add or kernel_extra_params_remove:
+            utils_test.update_boot_option(vm,
+                                          args_added=kernel_extra_params_add,
+                                          args_removed=kernel_extra_params_remove)
+
     elif not vm.is_alive():    # VM is dead and won't be started, update params
         vm.devices = None
         vm.params = params
@@ -312,6 +350,18 @@ def check_image(test, params, image_name, vm_process_status=None):
                               " Skip the image check.")
                 check_image_flag = False
 
+    # Save the potential bad image when the test is not passed.
+    # It should before image check.
+    if params.get("save_image", "no") == "yes":
+        if vm_process_status == "dead":
+            hsh = utils_misc.generate_random_string(4)
+            name = ("JOB-%s-TEST-%s-%s-%s.%s" % (
+                test.job.unique_id[:7], str(test.name.uid),
+                image_name, hsh, image.image_format))
+            image.save_image(params, name)
+        else:
+            logging.error("Not saving images, VM is not stopped.")
+
     if check_image_flag:
         try:
             if clone_master is None:
@@ -323,8 +373,8 @@ def check_image(test, params, image_name, vm_process_status=None):
             # FIXME: remove it from params, maybe as an img object attr
             params["img_check_failed"] = "yes"
             if (params.get("skip_cluster_leak_warn") == "yes" and
-                    "Leaked clusters" in e.message):
-                logging.warn(e.message)
+                    "Leaked clusters" in six.text_type(e)):
+                logging.warn(six.text_type(e))
             else:
                 raise e
 
@@ -358,7 +408,8 @@ def postprocess_image(test, params, image_name, vm_process_status=None):
         # with a new backup. i.e. assume pre-existing image/backup
         # would not be usable after this test succeeds. The best
         # example for this is when 'unattended_install' is run.
-        if params.get("backup_image", "no") == "yes":
+        if (params.get("backup_image_after_testing_passed", "no") == "yes" and
+                params.get("test_passed") == "True"):
             image.backup_image(params, base_dir, "backup", True)
 
     if (not restored and params.get("restore_image", "no") == "yes"):
@@ -399,6 +450,28 @@ def postprocess_vm(test, params, env, name):
     if not vm:
         return
 
+    if params.get("start_vm") == "yes":
+        # recover the changes done to kernel params in postprocess
+        kernel_extra_params_add = params.get("kernel_extra_params_add", "")
+        kernel_extra_params_remove = params.get("kernel_extra_params_remove", "")
+
+        if params.get("enable_guest_iommu") == "yes":
+            kernel_extra_params_add += " intel_iommu=on"
+            guest_iommu_option = params.get("guest_iommu_option")
+            if guest_iommu_option:
+                kernel_extra_params_add += " iommu=%s" % guest_iommu_option
+
+        if kernel_extra_params_add or kernel_extra_params_remove:
+            # VM might be brought down after test
+            if vm and not vm.is_alive():
+                if params.get("vm_type") == "libvirt":
+                    vm.start()
+                elif params.get("vm_type") == "qemu":
+                    vm.create(params=params)
+                utils_test.update_boot_option(vm,
+                                              args_added=kernel_extra_params_remove,
+                                              args_removed=kernel_extra_params_add)
+
     # Close all SSH sessions that might be active to this VM
     for s in vm.remote_sessions[:]:
         try:
@@ -407,13 +480,24 @@ def postprocess_vm(test, params, env, name):
         except Exception:
             pass
 
+    if params.get("vm_extra_dump_paths") is not None:
+        vm_extra_dumps = os.path.join(test.outputdir, "vm_extra_dumps")
+        if not os.path.exists(vm_extra_dumps):
+            os.makedirs(vm_extra_dumps)
+        for dump_path in params.get("vm_extra_dump_paths").split(";"):
+            try:
+                vm.copy_files_from(dump_path, vm_extra_dumps)
+            except:
+                logging.error("Could not copy the extra dump '%s' from the vm '%s'",
+                              dump_path, vm.name)
+
     if params.get("kill_vm") == "yes":
         kill_vm_timeout = float(params.get("kill_vm_timeout", 0))
         if kill_vm_timeout:
             utils_misc.wait_for(vm.is_dead, kill_vm_timeout, 0, 1)
         vm.destroy(gracefully=params.get("kill_vm_gracefully") == "yes")
         if params.get("kill_vm_libvirt") == "yes" and params.get("vm_type") == "libvirt":
-            vm.undefine()
+            vm.undefine(options=params.get('kill_vm_libvirt_options'))
 
     if params.get("enable_strace") == "yes":
         strace = test_setup.StraceQemu(test, params, env)
@@ -644,6 +728,11 @@ def preprocess(test, params, env):
     """
     error_context.context("preprocessing")
 
+    # Check host for any errors to start with and just report and
+    # clear it off, so that we do not get the false test failures.
+    if params.get("verify_host_dmesg", "yes") == "yes":
+        utils_misc.verify_dmesg(ignore_result=True)
+
     # For KVM to work in Power8 and Power9(compat guests)(<DD2.2)
     # systems we need to have SMT=off and it needs to be
     # done as root, here we do a check whether
@@ -666,7 +755,10 @@ def preprocess(test, params, env):
         if migration_setup:
             power9_compat_remote = "yes" == params.get("power9_compat_remote", "no")
             cpu_cmd = "grep cpu /proc/cpuinfo | awk '{print $3}' | head -n 1"
-            server_session = test_setup.remote_session(params)
+            remote_host = {'server_ip': params.get("remote_ip"),
+                           'server_pwd': params.get("remote_pwd"),
+                           'server_user': params.get("remote_user", "root")}
+            server_session = test_setup.remote_session(remote_host)
             cmd_output = server_session.cmd_status_output(cpu_cmd)
             if (cmd_output[0] == 0):
                 remote_cpu = cmd_output[1].strip().lower()
@@ -790,14 +882,37 @@ def preprocess(test, params, env):
             seLinuxBool.setup()
 
         image_name_only = os.path.basename(params["image_name"])
-        params['image_name'] = os.path.join(image_nfs.mount_dir,
-                                            image_name_only)
         for image_name in params.objects("images"):
             name_tag = "image_name_%s" % image_name
             if params.get(name_tag):
                 image_name_only = os.path.basename(params[name_tag])
                 params[name_tag] = os.path.join(image_nfs.mount_dir,
                                                 image_name_only)
+
+    firewalld_service = params.get('firewalld_service')
+    if firewalld_service == 'disable':
+        firewalld = service.Service("firewalld")
+        if firewalld.status():
+            firewalld.stop()
+            if firewalld.status():
+                test.log.warning('Failed to stop firewalld')
+    else:
+        if firewalld_service == 'enable':
+            firewalld = service.Service("firewalld")
+            if not firewalld.status():
+                firewalld.start()
+                if not firewalld.status():
+                    test.log.warning('Failed to start firewalld')
+
+        if distro.detect().name == 'Ubuntu':
+            params['firewalld_dhcp_workaround'] = "no"
+
+        # Workaround know issue where firewall blocks dhcp from guest
+        # through virbr0
+        if params.get('firewalld_dhcp_workaround', "no") == "yes":
+            firewall_cmd = utils_iptables.Firewall_cmd()
+            if not firewall_cmd.add_service('dhcp', permanent=True):
+                test.log.warning('Failed to add dhcp service to be permitted')
 
     # Start ip sniffing if it isn't already running
     # The fact it has to be started here is so that the test params
@@ -814,9 +929,20 @@ def preprocess(test, params, env):
     # migration and if arch is ppc with power8 then switch off smt
     # will be taken care in remote machine for migration to succeed
     if migration_setup:
-        dest_uri = libvirt_vm.complete_uri(params["server_ip"])
+        dest_uri = libvirt_vm.complete_uri(params["remote_ip"])
         migrate_setup = utils_test.libvirt.MigrationTest()
         migrate_setup.migrate_pre_setup(dest_uri, params)
+        # Map hostname and IP address of the hosts to avoid virsh
+        # to error out of resolving
+        hostname_ip = {str(virsh.hostname()): params['local_ip']}
+        hostname_ip[str(virsh.hostname(uri=dest_uri))] = params['remote_ip']
+        if not utils_net.map_hostname_ipaddress(hostname_ip):
+            test.cancel("Failed to map hostname and ipaddress of source host")
+        session = test_setup.remote_session(params)
+        if not utils_net.map_hostname_ipaddress(hostname_ip, session=session):
+            session.close()
+            test.cancel("Failed to map hostname and ipaddress of target host")
+        session.close()
 
     # Destroy and remove VMs that are no longer needed in the environment
     requested_vms = params.objects("vms")
@@ -834,7 +960,8 @@ def preprocess(test, params, env):
             env["cpu_model"] = utils_misc.get_qemu_best_cpu_model(params)
         params["cpu_model"] = env.get("cpu_model")
 
-    # Get the KVM kernel module version and write it as a keyval
+    version_info = {}
+    # Get the KVM kernel module version
     if os.path.exists("/dev/kvm"):
         kvm_version = os.uname()[2]
     else:
@@ -845,13 +972,13 @@ def preprocess(test, params, env):
         kvm_version = "Unknown"
 
     logging.debug("KVM version: %s" % kvm_version)
-    test.write_test_keyval({"kvm_version": kvm_version})
+    version_info["kvm_version"] = str(kvm_version)
 
     # Checking required kernel, if not satisfied, cancel test
     if params.get("required_kernel"):
         required_kernel = params.get("required_kernel")
         logging.info("Test requires kernel version: %s" % required_kernel)
-        match = re.search(r'[0-9]+\.[0-9]+\.[0-9](\-[0-9]+)?', kvm_version)
+        match = re.search(r'[0-9]+\.[0-9]+\.[0-9]+(\-[0-9]+)?', kvm_version)
         if match is None:
             test.cancel("Can not get host kernel version.")
         host_kernel = match.group(0)
@@ -859,7 +986,7 @@ def preprocess(test, params, env):
             test.cancel("Got host kernel version:%s, which is not in %s" %
                         (host_kernel, required_kernel))
 
-    # Get the KVM userspace version and write it as a keyval
+    # Get the KVM userspace version
     kvm_userspace_ver_cmd = params.get("kvm_userspace_ver_cmd", "")
 
     if kvm_userspace_ver_cmd:
@@ -879,14 +1006,14 @@ def preprocess(test, params, env):
         else:
             kvm_userspace_version = "Unknown"
 
-    logging.debug("KVM userspace version: %s" % kvm_userspace_version)
-    test.write_test_keyval({"kvm_userspace_version": kvm_userspace_version})
+    logging.debug("KVM userspace version(qemu): %s" % kvm_userspace_version)
+    version_info["qemu_version"] = str(kvm_userspace_version)
 
     # Checking required qemu, if not satisfied, cancel test
     if params.get("required_qemu"):
         required_qemu = params.get("required_qemu")
         logging.info("Test requires qemu version: %s" % required_qemu)
-        match = re.search(r'[0-9]+\.[0-9]+\.[0-9](\-[0-9]+)?',
+        match = re.search(r'[0-9]+\.[0-9]+\.[0-9]+(\-[0-9]+)?',
                           kvm_userspace_version)
         if match is None:
             test.cancel("Can not get host qemu version.")
@@ -895,6 +1022,20 @@ def preprocess(test, params, env):
             test.cancel("Got host qemu version:%s, which is not in %s" %
                         (host_qemu, required_qemu))
 
+    # Get the Libvirt version
+    if vm_type == "libvirt":
+        libvirt_ver_cmd = params.get("libvirt_ver_cmd", "libvirtd -V|awk -F' ' '{print $3}'")
+        try:
+            libvirt_version = decode_to_text(a_process.system_output(
+                libvirt_ver_cmd, shell=True)).strip()
+        except a_process.CmdError:
+            libvirt_version = "Unknown"
+        version_info["libvirt_version"] = str(libvirt_version)
+        logging.debug("KVM userspace version(libvirt): %s" % libvirt_version)
+
+    # Write it as a keyval
+    test.write_test_keyval(version_info)
+
     libvirtd_inst = utils_libvirtd.Libvirtd()
 
     # If guest is configured to be backed by hugepages, setup hugepages in host
@@ -902,7 +1043,9 @@ def preprocess(test, params, env):
         params["setup_hugepages"] = "yes"
 
     if params.get("setup_hugepages") == "yes":
+        global _pre_hugepages_surp
         h = test_setup.HugePageConfig(params)
+        _pre_hugepages_surp = h.ext_hugepages_surp
         suggest_mem = h.setup()
         if suggest_mem is not None:
             params['mem'] = suggest_mem
@@ -945,22 +1088,26 @@ def preprocess(test, params, env):
                         int(params.get("pre_command_timeout", "600")),
                         params.get("pre_command_noncritical") == "yes")
 
-    kernel_extra_params_add = params.get("kernel_extra_params_add", "")
-    kernel_extra_params_remove = params.get("kernel_extra_params_remove", "")
-    if params.get("disable_pci_msi"):
-        disable_pci_msi = params.get("disable_pci_msi")
-        if disable_pci_msi == "yes":
-            if "pci=" in kernel_extra_params_add:
-                kernel_extra_params_add = re.sub("pci=.*?\s+", "pci=nomsi ",
-                                                 kernel_extra_params_add)
-            else:
-                kernel_extra_params_add += " pci=nomsi"
-            params["ker_remove_similar_pci"] = "yes"
-        else:
-            kernel_extra_params_remove += " pci=nomsi"
+    # Sysprep the master image if requested, to customize image before cloning
+    if params.get("sysprep_required", "no") == "yes":
+        image_filename = storage.get_image_filename(params, base_dir)
+        sysprep_options = params.get("sysprep_options", "--operations machine-id")
+        # backup the original master image before customization
+        logging.info("Backup the master image before sysprep")
+        image_obj = qemu_storage.QemuImg(params, base_dir, image_filename)
+        image_obj.backup_image(params, base_dir, "backup", True, True)
+        logging.info("Syspreping the image as requested before cloning.")
+        try:
+            utils_libguestfs.virt_sysprep_cmd(
+                image_filename, options=sysprep_options, ignore_status=False)
+        except utils_libguestfs.LibguestfsCmdError as detail:
+            # when virt-sysprep fails the original master image is unchanged.
+            # We can remove backup image, so that test would not spend much time
+            # in restoring disk back during postprocess.
+            image_obj.rm_backup_image()
+            test.error("Sysprep failed: %s" % detail)
 
     # Clone master image from vms.
-    base_dir = data_dir.get_data_dir()
     if params.get("master_images_clone"):
         for vm_name in params.get("vms").split():
             vm = env.get_vm(vm_name)
@@ -970,21 +1117,14 @@ def preprocess(test, params, env):
 
             vm_params = params.object_params(vm_name)
             for image in vm_params.get("master_images_clone").split():
-                image_obj = qemu_storage.QemuImg(params, base_dir, image)
-                image_obj.clone_image(params, vm_name, image, base_dir)
+                image_obj = qemu_storage.QemuImg(vm_params, base_dir, image)
+                image_obj.clone_image(vm_params, vm_name, image, base_dir)
+            params["image_name_%s" % vm_name] = vm_params["image_name_%s" % vm_name]
+            params["image_name_%s_%s" % (image, vm_name)] = vm_params["image_name_%s_%s" % (image, vm_name)]
 
     # Preprocess all VMs and images
     if params.get("not_preprocess", "no") == "no":
         process(test, params, env, preprocess_image, preprocess_vm)
-
-    # change the kernel params if configured
-    if kernel_extra_params_add or kernel_extra_params_remove:
-        for vm in env.get_all_vms():
-            if vm:
-                if not vm.is_alive():
-                    vm.start()
-                utils_test.update_boot_option(vm, args_added=kernel_extra_params_add,
-                                              args_removed=kernel_extra_params_remove)
 
     # Start the screendump thread
     if params.get("take_regular_screendumps") == "yes":
@@ -1025,12 +1165,24 @@ def postprocess(test, params, env):
         guest_dmesg_log_file = utils_misc.get_path(test.debugdir, guest_dmesg_log_file)
         living_vms = [vm for vm in env.get_all_vms() if (vm.is_alive() and not vm.is_paused())]
         for vm in living_vms:
-            guest_dmesg_log_file += ".%s" % vm.name
+            if params.get("guest_dmesg_dump_console") == "yes":
+                guest_dmesg_log_file = None
+            else:
+                guest_dmesg_log_file += ".%s" % vm.name
             try:
                 vm.verify_dmesg(dmesg_log_file=guest_dmesg_log_file)
-            except exceptions.TestFail as details:
+            except Exception as details:
                 err += ("\n: Guest %s dmesg verification failed: %s"
                         % (vm.name, details))
+
+    base_dir = data_dir.get_data_dir()
+    # if sysprep was requested in preprocess then restore back the original image
+    if params.get("sysprep_required", "no") == "yes":
+        logging.info("Restoring the original master image.")
+        image_filename = storage.get_image_filename(params, base_dir)
+        image_obj = qemu_storage.QemuImg(params, base_dir, image_filename)
+        image_obj.backup_image(params, base_dir, "restore", True)
+        image_obj.rm_backup_image()
 
     # collect sosreport of guests during postprocess if enabled
     if params.get("enable_guest_sosreport", "no") == "yes":
@@ -1038,17 +1190,6 @@ def postprocess(test, params, env):
         for vm in living_vms:
             sosreport_path = vm.sosreport()
             logging.info("Sosreport for guest: %s", sosreport_path)
-
-    # recover the changes done to kernel params in postprocess
-    kernel_extra_params_add = params.get("kernel_extra_params_add", "")
-    kernel_extra_params_remove = params.get("kernel_extra_params_remove", "")
-    if kernel_extra_params_add or kernel_extra_params_remove:
-        for vm in env.get_all_vms():
-            if vm:
-                if not vm.is_alive():
-                    vm.start()
-                utils_test.update_boot_option(vm, args_added=kernel_extra_params_remove,
-                                              args_removed=kernel_extra_params_add)
 
     # Postprocess all VMs and images
     try:
@@ -1067,9 +1208,8 @@ def postprocess(test, params, env):
 
     # Encode an HTML 5 compatible video from the screenshots produced
     dir_rex = "(screendump\S*_[0-9]+_iter%s)" % test.iteration
-    screendump_dir = re.findall(dir_rex, str(os.listdir(test.debugdir)))
-    if screendump_dir:
-        screendump_dir = os.path.join(test.debugdir, screendump_dir[0])
+    for screendump_dir in re.findall(dir_rex, str(os.listdir(test.debugdir))):
+        screendump_dir = os.path.join(test.debugdir, screendump_dir)
         if (params.get("encode_video_files", "yes") == "yes" and
                 glob.glob("%s/*" % screendump_dir)):
             try:
@@ -1235,6 +1375,7 @@ def postprocess(test, params, env):
                 test_setup.switch_smt(state="on", params=params)
 
     if params.get("setup_hugepages") == "yes":
+        global _post_hugepages_surp
         try:
             h = test_setup.HugePageConfig(params)
             h.cleanup()
@@ -1243,6 +1384,8 @@ def postprocess(test, params, env):
         except Exception as details:
             err += "\nHP cleanup: %s" % str(details).replace('\\n', '\n  ')
             logging.error(details)
+        else:
+            _post_hugepages_surp = h.ext_hugepages_surp
 
     if params.get("setup_thp") == "yes":
         try:
@@ -1296,7 +1439,6 @@ def postprocess(test, params, env):
                                                                       '\n  ')
             logging.error(details)
 
-    base_dir = data_dir.get_data_dir()
     if params.get("storage_type") == "iscsi":
         try:
             iscsidev = qemu_storage.Iscsidev(params, base_dir, "iscsi")
@@ -1330,7 +1472,8 @@ def postprocess(test, params, env):
 
     # cleanup migration presetup in post process
     if migration_setup:
-        dest_uri = libvirt_vm.complete_uri(params["server_ip"])
+        dest_uri = libvirt_vm.complete_uri(params.get("server_ip",
+                                                      params.get("remote_ip")))
         migrate_setup = utils_test.libvirt.MigrationTest()
         migrate_setup.migrate_pre_setup(dest_uri, params, cleanup=True)
 
@@ -1376,6 +1519,9 @@ def postprocess(test, params, env):
 
     if err:
         raise RuntimeError("Failures occurred while postprocess:\n%s" % err)
+    elif _post_hugepages_surp > _pre_hugepages_surp:
+        leak_num = _post_hugepages_surp - _pre_hugepages_surp
+        raise exceptions.TestFail("%d huge pages leaked!" % leak_num)
 
 
 def postprocess_on_error(test, params, env):
@@ -1464,26 +1610,24 @@ def _take_screendumps(test, params, env):
                             test.background_errors.put(sys.exc_info())
                     elif inactivity_watcher == 'log':
                         logging.debug(msg)
-                try:
-                    os.link(cache[image_hash], screendump_filename)
-                except OSError:
-                    pass
             else:
                 inactivity[vm.instance] = time.time()
+            cache[image_hash] = screendump_filename
+            try:
                 try:
-                    try:
-                        image = PIL.Image.open(temp_filename)
-                        image.save(screendump_filename, format="JPEG",
-                                   quality=quality)
-                        cache[image_hash] = screendump_filename
-                    except IOError as error_detail:
-                        logging.warning("VM '%s' failed to produce a "
-                                        "screendump: %s", vm.name, error_detail)
-                        # Decrement the counter as we in fact failed to
-                        # produce a converted screendump
-                        counter[vm.instance] -= 1
-                except NameError:
-                    pass
+                    timestamp = os.stat(temp_filename).st_ctime
+                    image = PIL.Image.open(temp_filename)
+                    image = ppm_utils.add_timestamp(image, timestamp)
+                    image.save(screendump_filename, format="JPEG",
+                               quality=quality)
+                except (IOError, OSError) as error_detail:
+                    logging.warning("VM '%s' failed to produce a "
+                                    "screendump: %s", vm.name, error_detail)
+                    # Decrement the counter as we in fact failed to
+                    # produce a converted screendump
+                    counter[vm.instance] -= 1
+            except NameError:
+                pass
             os.unlink(temp_filename)
 
         if _screendump_thread_termination_event is not None:

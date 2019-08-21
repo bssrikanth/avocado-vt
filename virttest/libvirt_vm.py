@@ -422,6 +422,8 @@ class VM(virt_vm.BaseVM):
                nic_model -- string to pass as 'model' parameter for this
                NIC (e.g. e1000)
         """
+        from virttest.utils_test import libvirt
+
         # helper function for command line option wrappers
         def has_option(help_text, option):
             return bool(re.search(r"--%s" % option, help_text, re.MULTILINE))
@@ -509,45 +511,73 @@ class VM(virt_vm.BaseVM):
                 cmd += ",threads=%s" % threads
             return cmd
 
-        def add_numa(vcpus, max_mem, numa_nodes):
+        def add_numa():
             """
             Method to add Numa node to guest
-
-            :param vcpus: vcpus of guest
-            :param max_mem: max memory of guest
-            :param numa_nodes: No of guest numa nodes required
-
             :return: appended numa parameter to virt-install cmd
             """
             if not has_sub_option('cpu', 'cell'):
+                logging.warning("virt-install version does not support numa cmd line")
                 return ""
             cmd = " --cpu"
             cell = "cell%s.cpus=%s,cell%s.id=%s,cell%s.memory=%s"
             cells = ""
-
-            # we need atleast 1 vcpu for 1 numa node
-            if numa_nodes > vcpus:
-                numa_nodes = vcpus
-                params['numa_nodes'] = vcpus
-            if vcpus > 1:
-                cpus = vcpus // numa_nodes
-                cpus_balance = vcpus % numa_nodes
-                memory = max_mem // numa_nodes
-                memory_balance = max_mem % numa_nodes
+            numa_val = {}
+            for numa_node in params.objects("guest_numa_nodes"):
+                numa_params = params.object_params(numa_node)
+                numa_mem = numa_params.get("numa_mem")
+                numa_cpus = numa_params.get("numa_cpus")
+                numa_nodeid = numa_params.get("numa_nodeid")
+                numa_memdev = numa_params.get("numa_memdev")
+                numa_distance = numa_params.get("numa_distance", "").split()
+                numa_val[numa_nodeid] = [numa_cpus, numa_mem, numa_memdev,
+                                         numa_distance]
+            if numa_val:
+                for cellid, value in numa_val.items():
+                    cells += "%s," % cell % (cellid, value[0], cellid, cellid,
+                                             cellid, value[1])
+                    if value[3]:  # numa_distance
+                        for siblingid in range(len(value[3])):
+                            cells += "cell%s.distances.sibling%s.id=%s," % (cellid,
+                                                                            siblingid,
+                                                                            siblingid)
+                            cells += "cell%s.distances.sibling%s.value=%s," % (cellid,
+                                                                               siblingid,
+                                                                               value[3][siblingid])
             else:
-                cpus = vcpus
-                memory = max_mem
-            cpu_start = 0
-            for numa in range(numa_nodes):
-                if numa == numa_nodes - 1 and vcpus > 1:
-                    cpus = cpus + cpus_balance
-                    memory = memory + memory_balance
-                if cpus == 1:
-                    cpu_str = "%s" % (cpu_start + (cpus - 1))
+                # Lets calculate and assign the node cpu and memory
+                vcpus = int(params.get("smp"))
+                vcpu_max_cpus = params.get("vcpu_maxcpus")
+                max_mem = int(params.get("mem")) * 1024
+                maxmemory = params.get("maxmemory", None)
+                numa_nodes = int(params.get("numa_nodes", 2))
+                if vcpu_max_cpus:
+                    vcpus = int(vcpu_max_cpus)
+                if maxmemory:
+                    max_mem = int(maxmemory) * 1024
+                # we need atleast 1 vcpu for 1 numa node
+                if numa_nodes > vcpus:
+                    numa_nodes = vcpus
+                    params['numa_nodes'] = vcpus
+                if vcpus > 1:
+                    cpus = vcpus // numa_nodes
+                    cpus_balance = vcpus % numa_nodes
+                    memory = max_mem // numa_nodes
+                    memory_balance = max_mem % numa_nodes
                 else:
-                    cpu_str = "%s-%s" % (cpu_start, cpu_start + (cpus - 1))
-                cpu_start += cpus
-                cells += "%s," % cell % (numa, cpu_str, numa, numa, numa, memory)
+                    cpus = vcpus
+                    memory = max_mem
+                cpu_start = 0
+                for numa in range(numa_nodes):
+                    if numa == numa_nodes - 1 and vcpus > 1:
+                        cpus = cpus + cpus_balance
+                        memory = memory + memory_balance
+                    if cpus == 1:
+                        cpu_str = "%s" % (cpu_start + (cpus - 1))
+                    else:
+                        cpu_str = "%s-%s" % (cpu_start, cpu_start + (cpus - 1))
+                    cpu_start += cpus
+                    cells += "%s," % cell % (numa, cpu_str, numa, numa, numa, memory)
             cmd += " %s" % cells
             return cmd.strip(",")
 
@@ -894,6 +924,22 @@ class VM(virt_vm.BaseVM):
                 logging.warning("boot option is not supported")
             return result.rstrip(',')
 
+        def add_cputune(vcpu_cputune=""):
+            """
+            Add cputune for guest
+            """
+            if not vcpu_cputune:
+                return ""
+            cputune_list = vcpu_cputune.split(" ")
+            item = 0
+            cputune_str = " --cputune "
+            for vcpu, cpulist in enumerate(cputune_list):
+                if "N" in cpulist:
+                    continue
+                cputune_str += "vcpupin%s.cpuset=\"%s\",vcpupin%s.vcpu=\"%s\"," % (item, cpulist, item, vcpu)
+                item += 1
+            return cputune_str.rstrip(",")
+
         # End of command line option wrappers
 
         if name is None:
@@ -926,20 +972,8 @@ class VM(virt_vm.BaseVM):
         hvm_or_pv = params.get("hvm_or_pv", "hvm")
         # default to 'uname -m' output
         arch_name = params.get("vm_arch_name", platform.machine())
-        capabs = libvirt_xml.CapabilityXML()
-        try:
-            support_machine_type = capabs.guest_capabilities[
-                hvm_or_pv][arch_name]['machine']
-        except KeyError as detail:
-            if detail.args[0] == hvm_or_pv:
-                raise KeyError("No libvirt support for %s virtualization, "
-                               "does system hardware + software support it?"
-                               % hvm_or_pv)
-            elif detail.args[0] == arch_name:
-                raise KeyError("No libvirt support for %s virtualization of "
-                               "%s, does system hardware + software support "
-                               "it?" % (hvm_or_pv, arch_name))
-            raise
+        support_machine_type = libvirt.get_machine_types(arch_name, hvm_or_pv,
+                                                         ignore_status=False)
         logging.debug("Machine types supported for %s/%s: %s",
                       hvm_or_pv, arch_name, support_machine_type)
 
@@ -961,7 +995,10 @@ class VM(virt_vm.BaseVM):
         # Add the VM's name
         virt_install_cmd += add_name(help_text, name)
 
-        machine_type = params.get("machine_type")
+        # The machine_type format is [avocado-type:]machine_type
+        # where avocado-type is optional part and is used in
+        # tp-qemu to use different devices. Use only the second part
+        machine_type = params.get("machine_type").split(':', 1)[-1]
         if machine_type:
             if machine_type in support_machine_type:
                 virt_install_cmd += add_machine_type(help_text, machine_type)
@@ -995,17 +1032,7 @@ class VM(virt_vm.BaseVM):
                                         vcpu_sockets, vcpu_cores, vcpu_threads)
         numa = params.get("numa", "no") == "yes"
         if numa:
-            # Number of numa nodes required can be set in param
-            numa_nodes = int(params.get("numa_nodes", 2))
-            numa_vcpus = int(smp)
-            # virt-install takes --memory in MiB but --cpu cell adds numa
-            # memory in KiB by default
-            numa_memory = int(mem) * 1024
-            if vcpu_max_cpus:
-                numa_vcpus = int(vcpu_max_cpus)
-            if maxmemory:
-                numa_memory = int(maxmemory)
-            virt_install_cmd += add_numa(numa_vcpus, numa_memory, numa_nodes)
+            virt_install_cmd += add_numa()
             if params.get("numa_pin", "no") == "yes":
                 # Get online host numa nodes
                 host_numa_node = utils_misc.NumaInfo()
@@ -1058,6 +1085,9 @@ class VM(virt_vm.BaseVM):
                                             model=params.get('virt_cpu_model', ''),
                                             match=params.get('virt_cpu_match', ''),
                                             vendor=params.get('virt_cpu_vendor', False))
+        cputune_list = params.get("vcpu_cputune", "")
+        if cputune_list:
+            virt_install_cmd += add_cputune(cputune_list)
         # TODO: directory location for vmlinuz/kernel for cdrom install ?
         location = None
         if params.get("medium") == 'url':
@@ -1081,7 +1111,8 @@ class VM(virt_vm.BaseVM):
                                           params.get("cdrom_unattended"))
                 virt_install_cmd += add_cdrom(help_text, cdrom_path)
             else:
-                location = data_dir.get_data_dir()
+                location = os.path.join(data_dir.get_data_dir(),
+                                        params.get("cdrom_cd1"))
                 kernel_dir = os.path.dirname(params.get("kernel"))
                 kernel_parent_dir = os.path.dirname(kernel_dir)
                 pxeboot_link = os.path.join(kernel_parent_dir, "pxeboot")
@@ -1164,8 +1195,9 @@ class VM(virt_vm.BaseVM):
             base_dir = image_params.get("images_base_dir",
                                         data_dir.get_data_dir())
 
+            basename = params.get("storage_type") == "nfs"
             filename = storage.get_image_filename(image_params,
-                                                  base_dir)
+                                                  base_dir, basename=basename)
             if image_params.get("use_storage_pool") == "yes":
                 filename = None
                 virt_install_cmd += add_drive(help_text,
@@ -1314,7 +1346,7 @@ class VM(virt_vm.BaseVM):
         virtinstall_qemu_cmdline = params.get("virtinstall_qemu_cmdline", "")
         if virtinstall_qemu_cmdline:
             if has_option(help_text, "qemu-commandline"):
-                virt_install_cmd += " --qemu-commandline=%s" % virtinstall_qemu_cmdline
+                virt_install_cmd += ' --qemu-commandline="%s"' % virtinstall_qemu_cmdline
 
         virtinstall_extra_args = params.get("virtinstall_extra_args", "")
         if virtinstall_extra_args:
@@ -1407,34 +1439,16 @@ class VM(virt_vm.BaseVM):
         :param speed: speed of serial console
         :param remove: do remove operation
         """
-        try:
-            session = self.login()
-        except (remote.LoginError, virt_vm.VMError) as e:
-            logging.debug(e)
+        from . import utils_test
+        kernel_params = "console=%s" % device
+        if speed is not None:
+            kernel_params += ",%s" % speed
+        if remove:
+            utils_test.update_boot_option(self, args_removed=kernel_params)
         else:
-            try:
-                grub = "/boot/grub/grub.conf"
-                if not session.cmd_status("ls /boot/grub2/grub.cfg"):
-                    grub = "/boot/grub2/grub.cfg"
-                kernel_params = "console=%s" % device
-                if speed is not None:
-                    kernel_params += ",%s" % speed
-
-                output = session.cmd_output("cat %s" % grub)
-                if not re.search("console=%s" % device, output):
-                    if not remove:
-                        session.sendline("sed -i -e \'s/vmlinuz-.*/& %s/g\'"
-                                         " %s; sync" % (kernel_params, grub))
-                else:
-                    if remove:
-                        session.sendline("sed -i -e \'s/console=%s\w*\s//g\'"
-                                         " %s; sync" % (device, grub))
-                logging.debug("Set kernel params for %s successfully.", device)
-                return True
-            finally:
-                session.close()
-        logging.debug("Set kernel params for %s failed.", device)
-        return False
+            utils_test.update_boot_option(self, args_added=kernel_params)
+        logging.debug("Set kernel params for %s is successful", device)
+        return True
 
     def set_kernel_param(self, parameter, value=None, remove=False):
         """
@@ -1860,6 +1874,9 @@ class VM(virt_vm.BaseVM):
         params = self.params
         root_dir = self.root_dir
 
+        if self.params.get("storage_type") == "nfs":
+            storage.copy_nfs_image(self.params, data_dir.get_data_dir(),
+                                   basename=True)
         # Verify the md5sum of the ISO images
         for cdrom in params.objects("cdroms"):
             if params.get("medium") == "import":
@@ -2010,20 +2027,6 @@ class VM(virt_vm.BaseVM):
             fcntl.lockf(lockfile, fcntl.LOCK_UN)
             lockfile.close()
 
-    def uptime(self, connect_uri=None):
-        """
-        Get uptime of the vm instance.
-
-        :param connect_uri: Libvirt connect uri of vm
-        :return: uptime of the vm on success, None on failure
-        """
-        if connect_uri:
-            self.connect_uri = connect_uri
-            session = self.wait_for_serial_login()
-        else:
-            session = self.wait_for_login()
-        return utils_misc.get_uptime(session)
-
     def migrate(self, dest_uri="", option="--live --timeout 60", extra="",
                 **dargs):
         """
@@ -2046,6 +2049,16 @@ class VM(virt_vm.BaseVM):
         # Since dest_uri could be None, checking it is necessary.
         if result.exit_status == 0 and dest_uri:
             self.connect_uri = dest_uri
+
+        # Set vm name in case --dname is specified.
+        migrate_options = ""
+        if option:
+            migrate_options = str(option)
+        if extra:
+            migrate_options += " %s" % extra
+        if migrate_options.count("--dname"):
+            migrate_options_list = migrate_options.split()
+            self.name = migrate_options_list[migrate_options_list.index("--dname") + 1]
         self.create_serial_console()
         return result
 
@@ -2385,6 +2398,8 @@ class VM(virt_vm.BaseVM):
         session.close()
 
         error_context.context("logging in after reboot", logging.info)
+        if serial:
+            return self.wait_for_serial_login(timeout=timeout)
         return self.wait_for_login(nic_index, timeout=timeout)
 
     def screendump(self, filename, debug=False):
@@ -2480,7 +2495,7 @@ class VM(virt_vm.BaseVM):
             state = self.state()
             if state != 'paused':
                 virsh.suspend(
-                    self.name, uri=self.connect_uri, ignore_statues=False)
+                    self.name, uri=self.connect_uri, ignore_status=False)
             return True
         except Exception:
             logging.error("VM %s failed to suspend", self.name)
@@ -2839,7 +2854,7 @@ class VM(virt_vm.BaseVM):
         session.close()
         return mac.strip()
 
-    def install_package(self, name, ignore_status=False):
+    def install_package(self, name, ignore_status=False, timeout=300):
         """
         Install a package on VM.
         ToDo: Support multiple package manager.
@@ -2847,13 +2862,18 @@ class VM(virt_vm.BaseVM):
         :param name: Name of package to be installed
         """
         session = self.wait_for_login()
-        if not utils_package.package_install(name, session):
-            if not ignore_status:
-                session.close()
+        try:
+            if not utils_package.package_install(name, session, timeout=timeout):
                 raise virt_vm.VMError("Installation of package %s failed" %
                                       name)
-            logging.error("Installation of package %s failed", name)
-        session.close()
+        except Exception as exception_detail:
+            if ignore_status:
+                logging.error("When install: %s\nError happened: %s\n",
+                              name, exception_detail)
+            else:
+                raise exception_detail
+        finally:
+            session.close()
 
     def remove_package(self, name, ignore_status=False):
         """
@@ -2894,7 +2914,7 @@ class VM(virt_vm.BaseVM):
         if not self.is_alive():
             self.start()
 
-        self.install_package('pm-utils', ignore_status=True)
+        self.install_package('pm-utils', ignore_status=True, timeout=15)
         self.install_package('qemu-guest-agent')
 
         session = self.wait_for_login()

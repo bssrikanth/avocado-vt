@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import re
+import functools
 
 from avocado.core import exceptions
 from avocado.utils import process
@@ -32,8 +33,8 @@ def preprocess_images(bindir, params, env):
             vm.destroy(free_mac_addresses=False)
         vm_params = params.object_params(vm_name)
         for image in vm_params.get("master_images_clone").split():
-            image_obj = QemuImg(params, bindir, image)
-            image_obj.clone_image(params, vm_name, image, bindir)
+            image_obj = QemuImg(vm_params, bindir, image)
+            image_obj.clone_image(vm_params, vm_name, image, bindir)
 
 
 def preprocess_image_backend(bindir, params, env):
@@ -49,8 +50,8 @@ def postprocess_images(bindir, params):
     for vm in params.get("vms").split():
         vm_params = params.object_params(vm)
         for image in vm_params.get("master_images_clone").split():
-            image_obj = QemuImg(params, bindir, image)
-            image_obj.rm_cloned_image(params, vm, image, bindir)
+            image_obj = QemuImg(vm_params, bindir, image)
+            image_obj.rm_cloned_image(vm_params, vm, image, bindir)
 
 
 def file_exists(params, filename_path):
@@ -95,6 +96,18 @@ def file_remove(params, filename_path):
         rbd_image_name = "%s.%s" % (image_name.split("/")[-1], image_format)
         return ceph.rbd_image_rm(ceph_monitor, rbd_pool_name, rbd_image_name)
 
+    if params.get("gluster_brick"):
+        # TODO: Add implementation for gluster_brick
+        return
+
+    if params.get('storage_type') in ('iscsi', 'lvm'):
+        # TODO: Add implementation for iscsi/lvm
+        return
+
+    if os.path.exists(filename_path):
+        os.unlink(filename_path)
+        return
+
 
 def get_image_blkdebug_filename(params, root_dir):
     """
@@ -116,14 +129,13 @@ def get_image_blkdebug_filename(params, root_dir):
     return blkdebug_filename
 
 
-def get_image_filename(params, root_dir):
+def get_image_filename(params, root_dir, basename=False):
     """
     Generate an image path from params and root_dir.
 
     :param params: Dictionary containing the test parameters.
     :param root_dir: Base directory for relative filenames.
-    :param image_name: Force name of image.
-    :param image_format: Format for image.
+    :param basename: True to use only basename of image_name
 
     :note: params should contain:
            image_name -- the name of the image file, without extension
@@ -146,17 +158,18 @@ def get_image_filename(params, root_dir):
                                         image_format)
             return ceph.get_image_filename(ceph_monitor, rbd_pool_name,
                                            rbd_image_name)
-        return get_image_filename_filesytem(params, root_dir)
+        return get_image_filename_filesytem(params, root_dir, basename=basename)
     else:
         logging.warn("image_name parameter not set.")
 
 
-def get_image_filename_filesytem(params, root_dir):
+def get_image_filename_filesytem(params, root_dir, basename=False):
     """
     Generate an image path from params and root_dir.
 
     :param params: Dictionary containing the test parameters.
     :param root_dir: Base directory for relative filenames.
+    :param basename: True to use only basename of image_name
 
     :note: params should contain:
            image_name -- the name of the image file, without extension
@@ -189,13 +202,16 @@ def get_image_filename_filesytem(params, root_dir):
         return cmp(first, second)
 
     image_name = params.get("image_name", "image")
+    if basename:
+        image_name = os.path.basename(image_name)
     indirect_image_select = params.get("indirect_image_select")
     if indirect_image_select:
         re_name = image_name
         indirect_image_select = int(indirect_image_select)
         matching_images = decode_to_text(process.system_output("ls -1d %s" % re_name,
                                                                shell=True))
-        matching_images = sorted(matching_images.split('\n'), cmp=sort_cmp)
+        matching_images = sorted(matching_images.split('\n'),
+                                 key=functools.cmp_to_key(sort_cmp))
         if matching_images[-1] == '':
             matching_images = matching_images[:-1]
         try:
@@ -229,26 +245,23 @@ def get_image_filename_filesytem(params, root_dir):
     return image_filename
 
 
-def copy_nfs_image(params, image_name, root_dir):
+def copy_nfs_image(params, root_dir, basename=False):
     """
     copy image from image_path to nfs mount dir if image is not available
     or corrupted.
 
     :param params: Test dict params
-    :param image_name: Master image name.
     :param root_dir: Base directory for relative filenames.
+    :param basename: True to use only basename of image name
     :raise: TestSetupFail if image is unavailable/corrupted
     """
-    image_format = params.get("image_format", "qcow2")
     if params.get("setup_local_nfs", "no") == "yes":
         # check for image availability in NFS shared path
         base_dir = params.get("images_base_dir", data_dir.get_data_dir())
-        dst = get_image_filename(params, base_dir)
+        dst = get_image_filename(params, base_dir, basename=basename)
         if(not os.path.isfile(dst) or
            utils_misc.get_image_info(dst)['lcounts'].lower() == "true"):
-            source = os.path.join(root_dir, "images", image_name)
-            if image_format not in source:
-                source = "%s.%s" % (source, image_format)
+            source = get_image_filename(params, root_dir)
             logging.debug("Checking for image available in image data "
                           "path - %s", source)
             # check for image availability in images data directory
@@ -358,23 +371,6 @@ class QemuImg(object):
                image_name -- the name of the image file, without extension
                image_format -- the format of the image (qcow2, raw etc)
         """
-        def backup_raw_device(src, dst):
-            if os.path.exists(src):
-                _dst = dst + '.part'
-                process.system("dd if=%s of=%s bs=4k conv=sync" % (src, _dst))
-                os.rename(_dst, dst)
-            else:
-                logging.info("No source %s, skipping dd...", src)
-
-        def backup_image_file(src, dst):
-            if os.path.isfile(src):
-                logging.debug("Copying %s -> %s", src, dst)
-                _dst = dst + '.part'
-                shutil.copy(src, _dst)
-                os.rename(_dst, dst)
-            else:
-                logging.info("No source file %s, skipping copy...", src)
-
         def get_backup_set(filename, backup_dir, action, good):
             """
             Get all sources and destinations required for each backup.
@@ -383,6 +379,10 @@ class QemuImg(object):
                 os.makedirs(backup_dir)
             basename = os.path.basename(filename)
             bkp_set = []
+            if action not in ('backup', 'restore'):
+                logging.error("No backup sets for action: %s, state: %s",
+                              action, good)
+                return bkp_set
             if good:
                 src = filename
                 dst = os.path.join(backup_dir, "%s.backup" % basename)
@@ -404,51 +404,33 @@ class QemuImg(object):
                     bkp_set = [[src_bad, dst_bad], [src_good, dst_good]]
                 elif action == 'restore':
                     bkp_set = [[src_good, src_bad]]
-
-            if not bkp_set:
-                logging.error("No backup sets for action: %s, state: %s",
-                              action, good)
-
             return bkp_set
 
-        image_filename = self.image_filename
         backup_dir = params.get("backup_dir", "")
         if not os.path.isabs(backup_dir):
             backup_dir = os.path.join(root_dir, backup_dir)
         if params.get('image_raw_device') == 'yes':
-            iname = "raw_device"
-            iformat = params.get("image_format", "qcow2")
-            ifilename = "%s.%s" % (iname, iformat)
-            ifilename = utils_misc.get_path(root_dir, ifilename)
+            ifmt = params.get("image_format", "qcow2")
+            ifilename = utils_misc.get_path(root_dir, ("raw_device.%s" % ifmt))
             backup_set = get_backup_set(ifilename, backup_dir, action, good)
-            backup_func = backup_raw_device
+            backup_func = self.copy_data_raw
         else:
-            backup_set = get_backup_set(image_filename, backup_dir, action,
-                                        good)
-            backup_func = backup_image_file
+            backup_set = get_backup_set(self.image_filename, backup_dir,
+                                        action, good)
+            backup_func = self.copy_data_file
 
         if action == 'backup':
-            image_dir = os.path.dirname(image_filename)
-            s = os.statvfs(image_dir)
-            image_dir_disk_free = s.f_bavail * s.f_bsize
-
             backup_size = 0
             for src, dst in backup_set:
                 if os.path.isfile(src):
                     backup_size += os.path.getsize(src)
 
-            minimum_disk_free = 1.2 * backup_size
-            if image_dir_disk_free < minimum_disk_free:
-                image_dir_disk_free_gb = float(image_dir_disk_free) / 10 ** 9
-                backup_size_gb = float(backup_size) / 10 ** 9
-                minimum_disk_free_gb = float(minimum_disk_free) / 10 ** 9
-                logging.error("Free space on %s: %.1f GB", image_dir,
-                              image_dir_disk_free_gb)
-                logging.error("Backup size: %.1f GB", backup_size_gb)
-                logging.error("Minimum free space acceptable: %.1f GB",
-                              minimum_disk_free_gb)
-                logging.error("Available disk space is not sufficient for a "
-                              "full backup. Skipping backup...")
+            image_dir = os.path.dirname(self.image_filename)
+            s = os.statvfs(image_dir)
+            image_dir_free_disk_size = s.f_bavail * s.f_bsize
+            logging.info("Checking disk size on %s.", image_dir)
+            if not self.is_disk_size_enough(backup_size,
+                                            image_dir_free_disk_size):
                 return
 
         for src, dst in backup_set:
@@ -457,6 +439,84 @@ class QemuImg(object):
                               dst)
                 continue
             backup_func(src, dst)
+
+    def rm_backup_image(self):
+        """
+        Remove backup image
+        """
+        backup_dir = utils_misc.get_path(self.root_dir,
+                                         self.params.get("backup_dir", ""))
+        image_name = os.path.join(backup_dir, "%s.backup" %
+                                  os.path.basename(self.image_filename))
+        logging.debug("Removing image file %s as requested", image_name)
+        if os.path.exists(image_name):
+            os.unlink(image_name)
+        else:
+            logging.warning("Image file %s not found", image_name)
+
+    def save_image(self, params, filename, root_dir=None):
+        """
+        Save images to a path for later debugging.
+
+        :param params: Dictionary containing the test parameters.
+        :param filename: new filename for saved images.
+        :param root_dir: directory for saved images.
+
+        """
+        src = self.image_filename
+        if root_dir is None:
+            root_dir = os.path.dirname(src)
+        backup_func = self.copy_data_file
+        if params.get('image_raw_device') == 'yes':
+            ifmt = params.get("image_format", "qcow2")
+            src = utils_misc.get_path(root_dir, ("raw_device.%s" % ifmt))
+            backup_func = self.copy_data_raw
+
+        backup_size = 0
+        if os.path.isfile(src):
+            backup_size = os.path.getsize(src)
+        s = os.statvfs(root_dir)
+        image_dir_free_disk_size = s.f_bavail * s.f_bsize
+        logging.info("Checking disk size on %s.", root_dir)
+        if not self.is_disk_size_enough(backup_size,
+                                        image_dir_free_disk_size):
+            return
+
+        backup_func(src, utils_misc.get_path(root_dir, filename))
+
+    @staticmethod
+    def is_disk_size_enough(required, available):
+        """Check if available disk size is enough for the data copy."""
+        minimum_disk_free = 1.2 * required
+        if available < minimum_disk_free:
+            logging.error("Free space: %s MB", (available / 1048576.))
+            logging.error("Backup size: %s MB", (required / 1048576.))
+            logging.error("Minimum free space acceptable: %s MB",
+                          (minimum_disk_free / 1048576.))
+            logging.error("Available disk space is not enough. Skipping...")
+            return False
+        return True
+
+    @staticmethod
+    def copy_data_raw(src, dst):
+        """Using dd for raw device."""
+        if os.path.exists(src):
+            _dst = dst + '.part'
+            process.system("dd if=%s of=%s bs=4k conv=sync" % (src, _dst))
+            os.rename(_dst, dst)
+        else:
+            logging.info("No source %s, skipping dd...", src)
+
+    @staticmethod
+    def copy_data_file(src, dst):
+        """Copy for files."""
+        if os.path.isfile(src):
+            logging.debug("Copying %s -> %s", src, dst)
+            _dst = dst + '.part'
+            shutil.copy(src, _dst)
+            os.rename(_dst, dst)
+        else:
+            logging.info("No source file %s, skipping copy...", src)
 
     @staticmethod
     def clone_image(params, vm_name, image_name, root_dir):
@@ -475,13 +535,14 @@ class QemuImg(object):
                 image_params = params.object_params(image_name)
                 image_params["image_name"] = vm_image_name
 
-                m_image_fn = get_image_filename(params, root_dir)
+                master_image = params.get("master_image_name")
+                if master_image:
+                    image_format = params.get("image_format", "qcow2")
+                    m_image_fn = "%s.%s" % (master_image, image_format)
+                    m_image_fn = utils_misc.get_path(root_dir, m_image_fn)
+                else:
+                    m_image_fn = get_image_filename(params, root_dir)
                 image_fn = get_image_filename(image_params, root_dir)
-
-                # If image is not available/corrupted in nfs share location
-                # ensure it is copied before cloning
-                if params.get("storage_type") == "nfs":
-                    copy_nfs_image(params, image_name, root_dir)
                 force_clone = params.get("force_image_clone", "no")
                 if not os.path.exists(image_fn) or force_clone == "yes":
                     logging.info("Clone master image for vms.")

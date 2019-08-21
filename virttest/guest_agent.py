@@ -127,6 +127,7 @@ class QemuAgent(Monitor):
     CMD_TIMEOUT = 20
     RESPONSE_TIMEOUT = 20
     PROMPT_TIMEOUT = 20
+    FSFREEZE_TIMEOUT = 90
 
     SERIAL_TYPE_VIRTIO = "virtio"
     SERIAL_TYPE_ISA = "isa"
@@ -228,7 +229,7 @@ class QemuAgent(Monitor):
         objs = []
         for line in s.splitlines():
             try:
-                if line[0] == b'\xff':
+                if line[0:1] == b'\xff':
                     line = line[1:]
                 objs += [json.loads(line)]
                 self._log_lines(line.decode(errors="replace"))
@@ -514,8 +515,10 @@ class QemuAgent(Monitor):
         if mode in [self.SHUTDOWN_MODE_POWERDOWN, self.SHUTDOWN_MODE_REBOOT,
                     self.SHUTDOWN_MODE_HALT]:
             args = {"mode": mode}
-        self.cmd(cmd=cmd, args=args, success_resp=False)
-        return True
+        try:
+            self.cmd(cmd=cmd, args=args)
+        except VAgentProtocolError:
+            pass
 
     @error_context.context_aware
     def sync(self, sync_mode="guest-sync"):
@@ -674,7 +677,7 @@ class QemuAgent(Monitor):
             raise VAgentFreezeStatusError(self.vm.name, status, expected)
 
     @error_context.context_aware
-    def fsfreeze(self, check_status=True):
+    def fsfreeze(self, check_status=True, timeout=FSFREEZE_TIMEOUT):
         """
         Freeze File system on guest.
 
@@ -689,7 +692,7 @@ class QemuAgent(Monitor):
 
         cmd = "guest-fsfreeze-freeze"
         if self.check_has_command(cmd):
-            ret = self.cmd(cmd=cmd)
+            ret = self.cmd(cmd=cmd, timeout=timeout)
             if check_status:
                 try:
                     self.verify_fsfreeze_status(self.FSFREEZE_STATUS_FROZEN)
@@ -730,3 +733,145 @@ class QemuAgent(Monitor):
                     raise
             return ret
         return -1
+
+    def _cmd_args_update(self, cmd, **kwargs):
+        """
+        Update qga commands' args.
+
+        :param cmd: command to send.
+        :param kwargs: optional keyword arguments.
+        :return: The command's output.
+        """
+        self.check_has_command(cmd)
+        # update kwargs
+        for key in list(kwargs.keys()):
+            if kwargs[key] is None:
+                kwargs.pop(key)
+                continue
+            if "_" in key:
+                key_new = key.replace("_", "-")
+                args = {key_new: kwargs[key]}
+                kwargs.pop(key)
+                kwargs.update(args)
+
+        return self.cmd(cmd=cmd, args=kwargs)
+
+    def guest_file_open(self, path, mode=None):
+        """
+        Open a guest file.
+
+        :param path: full path to the file in the guest to open.
+        :param mode: optional open mode, "r" is the default value.
+        :return: file handle.
+        """
+        cmd = "guest-file-open"
+        return self._cmd_args_update(cmd, path=path, mode=mode)
+
+    def guest_file_close(self, handle):
+        """
+        Close an opened guest file.
+
+        :param handle: file handle returned by guest-file-open.
+        :return: no-error return.
+        """
+        cmd = "guest-file-close"
+        return self._cmd_args_update(cmd, handle=handle)
+
+    def guest_file_write(self, handle, content, count=None):
+        """
+        Write to guest file.
+
+        :param handle: file handle returned by guest-file-open.
+        :param content: content to write.
+        :param count: optional bytes to write (actual bytes, after
+               base64-decode),default is all content in buf-b64 buffer
+               after base64 decoding
+        :return: a dict with count and eof.
+        """
+        cmd = "guest-file-write"
+        con_encode = base64.b64encode(content.encode()).decode()
+        return self._cmd_args_update(cmd, handle=handle,
+                                     buf_b64=con_encode, count=count)
+
+    def guest_file_read(self, handle, count=None):
+        """
+        Read guest file.
+
+        :param handle: file handle returned by guest-file-open.
+        :param count: optional,maximum number of bytes to read before
+                      base64-encoding is applied(default is 4KB)
+        :return: a dict with base64-encoded string content,count and eof.
+        """
+        cmd = "guest-file-read"
+        return self._cmd_args_update(cmd, handle=handle, count=count)
+
+    def guest_file_flush(self, handle):
+        """
+        Flush the write content to disk.
+
+        :param handle: file handle returned by guest-file-open.
+        :return: no-error return.
+        """
+        cmd = "guest-file-flush"
+        return self._cmd_args_update(cmd, handle=handle)
+
+    def guest_file_seek(self, handle, offset, whence):
+        """
+        Seek the position of guest file.
+
+        :param handle: filehandle returned by guest-file-open.
+        :param offset: offset of whence.
+        :param whence: 0,file beginning;
+                       1,file current position;
+                       2,file end
+        :return: a dict with position and eof.
+        """
+        cmd = "guest-file-seek"
+        return self._cmd_args_update(cmd, handle=handle, offset=offset,
+                                     whence=whence)
+
+    def guest_exec(self, path, arg=None, env=None, input_data=None,
+                   capture_output=None):
+        """
+        Execute a command in the guest.
+
+        :param path: path or executable name to execute
+        :param arg: argument list to pass to executable
+        :param env: environment variables to pass to executable
+        :param input_data: data to be passed to process stdin (base64 encoded)
+        :param capture_output: bool flag to enable capture of stdout/stderr of
+                               running process,defaults to false.
+        :return: PID on success
+        """
+        cmd = "guest-exec"
+        return self._cmd_args_update(cmd, path=path, arg=arg, env=env,
+                                     input_data=input_data,
+                                     capture_output=capture_output)
+
+    def guest_exec_status(self, pid):
+        """
+        Check status of process associated with PID retrieved via guest-exec.
+        Read the process and associated metadata if it has exited.
+
+        :param pid: pid returned from guest-exec
+        :return: GuestExecStatus on success,
+                 such as exited,exitcode,out-data,error-data and so on
+        """
+        cmd = "guest-exec-status"
+        return self._cmd_args_update(cmd, pid=pid)
+
+    def get_fsinfo(self):
+        """
+        Send "guest-get-fsinfo", return file system info of guest.
+        """
+        cmd = "guest-get-fsinfo"
+        self.check_has_command(cmd)
+        return self.cmd(cmd)
+
+    def get_osinfo(self):
+        """
+        Send "guest-get-osinfo", return operating system info of guest.
+        """
+        cmd = "guest-get-osinfo"
+        self.check_has_command(cmd)
+        return self.cmd(cmd)

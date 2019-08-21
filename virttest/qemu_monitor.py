@@ -5,14 +5,17 @@ Interfaces to the QEMU monitor.
 """
 
 from __future__ import division
-import socket
-import time
-import threading
+
 import logging
-import select
-import re
 import os
+import re
+import select
+import socket
+import threading
+import time
+
 import six
+
 try:
     import json
 except ImportError:
@@ -23,6 +26,8 @@ from . import passfd_setup
 from . import utils_misc
 from . import cartesian_config
 from . import data_dir
+
+from virttest.qemu_capabilities import Flags
 
 
 class MonitorError(Exception):
@@ -174,15 +179,70 @@ def wait_for_create_monitor(vm, monitor_name, monitor_params, timeout):
         raise MonitorConnectError(monitor_name)
 
 
+def get_monitor_function(vm, cmd):
+    """
+    Get support function by function name
+    """
+    cmd = vm.monitor.get_workable_cmd(cmd)
+    func_name = cmd.replace("-", "_")
+    return getattr(vm.monitor, func_name)
+
+
+def x_non_x_feature(feature):
+    """
+    Reports the other of the x-/non-x- prefixed feature to the given feature
+
+    :param feature: asked-for feature
+    :return: when $feature startswith x- it reports non-x- variant, otherwise
+             it prefixes x-
+    """
+    if feature.startswith("x-"):
+        return feature[2:]
+    else:
+        return "x-%s" % feature
+
+
+def pick_supported_x_feature(feature, supported_features,
+                             disable_auto_x_evaluation,
+                             error_on_missing=False, feature_type="Feature"):
+    """
+    Attempts to choose supported feature with/without "x-" prefix based
+    on list of supported features.
+
+    :param feature: feature that allows x- or non-x- prefix
+    :param supported_features: list of supported features
+    :param error_on_missing: whether to fail when no variant is supported
+    :param feature_type: type of the feature used for exception description
+    :param disable_auto_x_evaluation: Whether to automatically choose
+                                      feature with/without "x-" prefix
+    :return: supported variant of the feature or the original one when no
+             match is found
+    :raise MonitorNotSupportedError: When error_on_missing is enabled and
+                                     the feature is not supported.
+    """
+    if disable_auto_x_evaluation or (feature in supported_features):
+        return feature
+    feature2 = x_non_x_feature(feature)
+    if feature2 in supported_features:
+        return feature2
+    if error_on_missing:
+        raise MonitorNotSupportedError("%s %s, nor %s supported."
+                                       % (feature_type, feature, feature2))
+    # capability2 also not supported, probably negative testing,
+    # return the original capability.
+    return feature
+
+
 class VM(object):
     """
     Dummy class to represent "vm.name" for pickling to avoid circular deps
     """
+
     def __init__(self, name):
         self.name = name
 
 
-class Monitor:
+class Monitor(object):
 
     """
     Common code for monitor classes.
@@ -203,6 +263,7 @@ class Monitor:
         :raise MonitorConnectError: Raised if the connection fails
         """
         self.vm = VM(vm.name)
+        self._enable_blockdev = vm.check_capability(Flags.BLOCKDEV)
         self.name = name
         self.filename = filename
         self._lock = threading.RLock()
@@ -212,14 +273,20 @@ class Monitor:
         self._passfd = None
         self._supported_cmds = []
         self.debug_log = False
-        self.log_file = "%s-%s.log" % (name, vm.name)
+        vm_pid = vm.get_pid()
+        if vm_pid is None:
+            vm_pid = 'unknown'
+        self.log_file = "%s-%s-pid-%s.log" % (name, vm.name, vm_pid)
         self.open_log_files = {}
+        self._supported_migrate_capabilities = None
+        self._supported_migrate_parameters = None
 
         try:
             self._socket.connect(filename)
         except socket.error as details:
             raise MonitorConnectError("Could not connect to monitor socket: %s"
                                       % details)
+        self._server_closed = False
 
     def __del__(self):
         # Automatically close the connection when the instance is garbage
@@ -267,6 +334,12 @@ class Monitor:
         # any representation whatsoever.
         return VM(self.vm.name), self.name, self.filename, True
 
+    def __reduce__(self):
+        """
+        Backward-compatible way to use __getinitargs__ on py3
+        """
+        return self.__class__, (self.__getinitargs__())
+
     def _close_sock(self):
         try:
             self._socket.shutdown(socket.SHUT_RDWR)
@@ -285,6 +358,8 @@ class Monitor:
         return False
 
     def _data_available(self, timeout=DATA_AVAILABLE_TIMEOUT):
+        if self._server_closed:
+            return False
         timeout = max(0, timeout)
         try:
             return bool(select.select([self._socket], [], [], timeout)[0])
@@ -305,6 +380,7 @@ class Monitor:
                 raise MonitorSocketError("Could not receive data from monitor",
                                          e)
             if not data:
+                self._server_closed = True
                 break
             s += data
         return s
@@ -346,7 +422,7 @@ class Monitor:
             timestr = time.strftime("%Y-%m-%d %H:%M:%S")
             try:
                 if log not in self.open_log_files:
-                    self.open_log_files[log] = open(log, "w")
+                    self.open_log_files[log] = open(log, "a")
                 for line in log_str.splitlines():
                     self.open_log_files[log].write(
                         "%s: %s\n" % (timestr, line))
@@ -361,17 +437,23 @@ class Monitor:
         finally:
             self._log_lock.release()
 
-    def correct(self, cmd):
+    def get_workable_cmd(self, cmd):
         """
         Automatic conversion "-" and "_" in commands if the translate command
         is supported commands;
         """
+
         def translate(cmd):
             return "-".join(re.split("[_-]", cmd))
 
+        found = False
         if not self._has_command(cmd):
             for _cmd in self._supported_cmds:
                 if translate(_cmd) == translate(cmd):
+                    found = True
+                elif translate(_cmd) == translate("x-%s" % cmd):
+                    found = True
+                if found:
                     logging.info("Convert command %s -> %s", cmd, _cmd)
                     return _cmd
         return cmd
@@ -515,23 +597,24 @@ class Monitor:
         for line in info:
             if not line.strip():
                 continue
-            if not line.startswith(' '):   # new block device
+            if not line.startswith(' '):  # new block device
                 line = line.split(':', 1)
-                name = line[0].split(' ', 1)[0]  # disregard extra info such as #(blockNNN)
+                # disregard extra info such as #(blockNNN)
+                name = line[0].split(' ', 1)[0]
                 line = line[1][1:]
                 blocks[name] = {}
                 if line == "[not inserted]":
                     blocks[name]['not-inserted'] = 1
                     continue
                 line = line.rsplit(' (', 1)
-                if len(line) == 1:       # disk_name
+                if len(line) == 1:  # disk_name
                     blocks[name]['file'] = line
-                else:       # disk_name (options)
+                else:  # disk_name (options)
                     blocks[name]['file'] = line[0]
                     options = (_.strip() for _ in line[1][:-1].split(','))
                     _ = False
                     for option in options:
-                        if not _:   # First argument is driver (qcow2, raw, ..)
+                        if not _:  # First argument is driver (qcow2, raw, ..)
                             blocks[name]['drv'] = option
                             _ = True
                         elif option == 'read-only':
@@ -563,17 +646,18 @@ class Monitor:
 
         return blocks
 
-    @staticmethod
-    def _parse_info_block_qmp(info):
+    def _parse_info_block_qmp(self, info):
         """
         Parse output of "query block" into dict of disk params
         """
         blocks = {}
         for item in info:
-            if not item.get('device'):
-                raise ValueError("Incorrect QMP respone, device not set in"
-                                 "info block: %s" % info)
-            name = item.pop('device')
+            if not item.get('inserted').get(
+                    'node-name') if self._enable_blockdev else not item.get('device'):
+                raise ValueError("Incorrect QMP respone, device or node-name "
+                                 "not set in info block: %s" % info)
+            name = item.get('inserted').get(
+                'node-name') if self._enable_blockdev else item.pop('device')
             blocks[name] = {}
             if 'inserted' not in item:
                 blocks[name]['not-inserted'] = True
@@ -619,9 +703,40 @@ class Monitor:
             old_progress = progress
             time.sleep(0.1)
 
+    def _get_migrate_capability(self, capability,
+                                disable_auto_x_evaluation=True):
+        """
+        Verify the $capability is listed in migrate-capabilities. If not try
+        x-/non-x- version. In case none is supported, return the original param
+
+        :param capability: migrate capability
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          feature with/without "x-" prefix
+        :return: migrate paramter that is hopefully supported
+        """
+        return pick_supported_x_feature(capability,
+                                        self._supported_migrate_capabilities,
+                                        disable_auto_x_evaluation)
+
+    def _get_migrate_parameter(self, parameter, error_on_missing=False,
+                               disable_auto_x_evaluation=True):
+        """
+        Verify the $parameter is listed in migrate-parameters. If not try
+        x-/non-x- version. In case none is supported, return the original param
+
+        :param parameter: migrate parameter
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          param with/without "x-" prefix
+        :return: migrate paramter that is hopefully supported
+        """
+        return pick_supported_x_feature(parameter,
+                                        self._supported_migrate_parameters,
+                                        disable_auto_x_evaluation,
+                                        error_on_missing,
+                                        "Migration parameter")
+
 
 class HumanMonitor(Monitor):
-
     """
     Wraps "human monitor" commands.
     """
@@ -645,7 +760,7 @@ class HumanMonitor(Monitor):
                 docstring.
         """
         try:
-            Monitor.__init__(self, vm, name, filename)
+            super(HumanMonitor, self).__init__(vm, name, filename)
 
             self.protocol = "human"
 
@@ -954,7 +1069,7 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         cmd += " %s" % device
         if speed is not None:
@@ -978,7 +1093,7 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         cmd += " %s" % device
         if speed:
@@ -1001,7 +1116,7 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         cmd += " %s %sB" % (device, speed)
         return self.cmd(cmd)
@@ -1016,7 +1131,7 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         cmd += " %s" % device
         return self.send_args_cmd(cmd)
@@ -1031,7 +1146,7 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         cmd += " %s" % device
         return self.send_args_cmd(cmd)
@@ -1046,10 +1161,79 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         cmd += " %s" % device
         return self.send_args_cmd(cmd)
+
+    def job_dismiss(self, identifier):
+        """Dismiss a block job"""
+        raise NotImplementedError
+
+    def blockdev_create(self, job_id, options):
+        """
+        Create block device image file by qemu
+
+        :param kwargs: dictionary containing required parameters
+        :return: block job ID
+        :rtype: string
+        """
+        raise NotImplementedError
+
+    def blockdev_backup(self, options):
+        """
+        Backup block device via QMP command blockdev-backup
+
+        :param kwargs: dictionary containing required parameters
+        :return: block job ID
+        :rtype: string
+        """
+        raise NotImplementedError
+
+    def debug_block_dirty_bitmap_sha256(self, node, bitmap):
+        """
+        get sha256 of bitmap
+
+        :param string node: node name
+        :param string bitmap: bitmap name
+        """
+        raise NotImplementedError
+
+    def x_debug_block_dirty_bitmap_sha256(self, node, bitmap):
+        """
+        get sha256 of bitmap
+
+        :param string node: node name
+        :param string bitmap: bitmap name
+        """
+        raise NotImplementedError
+
+    def block_dirty_bitmap_merge(self, node, src_bitmaps, dst_bitmap):
+        """
+        Merge source bitmaps into target bitmap in node
+
+        :param node: device ID or node-name
+        :param src_bitmaps: source bitmap list
+        :param dst_bitmap: target bitmap name
+        """
+        raise NotImplementedError
+
+    def x_block_dirty_bitmap_merge(self, node, src_bitmap, dst_bitmap):
+        """
+        Merge source bitmaps to target bitmap for given node
+
+        :param string node: block device node name
+        :parma list src_bitmaps: list of source bitmaps
+        :param string dst_bitmap: target bitmap name
+        :raise: MonitorNotSupportedCmdError if 'block-dirty-bitmap-mege' and
+                'x-block-dirty-bitmap-mege' commands not supported by QMP
+                monitor.
+        """
+        raise NotImplementedError
+
+    def query_named_block_nodes(self):
+        """Query named block nodes info"""
+        raise NotImplementedError
 
     def query_block_job(self, device):
         """
@@ -1075,6 +1259,10 @@ class HumanMonitor(Monitor):
                 job["speed"] = int(re.findall("\d+", output)[-1])
                 break
         return job
+
+    def query_jobs(self):
+        """Query block job info """
+        return self.query("jobs")
 
     def get_backingfile(self, device):
         """
@@ -1113,11 +1301,12 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = " %s %s %s" % (device, target, kwargs.get("format", "qcow2"))
         info = str(self.cmd("help %s" % cmd))
-        if (kwargs.get("mode", "absolute-paths") == "existing") and "-n" in info:
+        if (kwargs.get("mode", "absolute-paths")
+                == "existing") and "-n" in info:
             args = "-n %s" % args
         if (sync == "full") and "-f" in info:
             args = "-f %s" % args
@@ -1140,7 +1329,7 @@ class HumanMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = "%s" % device
         info = str(self.cmd("help %s" % cmd))
@@ -1149,7 +1338,8 @@ class HumanMonitor(Monitor):
         cmd = "%s %s" % (cmd, args)
         return self.cmd(cmd)
 
-    def migrate(self, uri, full_copy=False, incremental_copy=False, wait=False):
+    def migrate(self, uri, full_copy=False,
+                incremental_copy=False, wait=False):
         """
         Migrate.
 
@@ -1294,12 +1484,28 @@ class HumanMonitor(Monitor):
         size = float(normalize_data_size("%sB" % size, 'M', '1024'))
         return self.cmd("balloon %d" % size)
 
-    def set_migrate_capability(self, state, capability):
+    def _get_migrate_capability(self, capability,
+                                disable_auto_x_evaluation=True):
+        if self._supported_migrate_capabilities is None:
+            ret = self.query("migrate_capabilities")
+            caps = []
+            for line in ret.splitlines():
+                split = line.split(':', 1)
+                if len(split) == 2:
+                    caps.append(split[0])
+            self._supported_migrate_capabilities = caps
+        return super(HumanMonitor, self)._get_migrate_capability(capability,
+                                                                 disable_auto_x_evaluation)
+
+    def set_migrate_capability(self, state, capability,
+                               disable_auto_x_evaluation=True):
         """
         Set the capability of migrate to state.
 
         :param state: Bool value of capability.
         :param capability: capability which need to set.
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          feature with/without "x-" prefix
         :raise MonitorNotSupportedMigCapError: if the capability is unknown
         """
         cmd = "migrate_set_capability"
@@ -1307,6 +1513,8 @@ class HumanMonitor(Monitor):
         value = "off"
         if state:
             value = "on"
+        capability = self._get_migrate_capability(capability,
+                                                  disable_auto_x_evaluation)
         cmd += " %s %s" % (capability, value)
         result = self.cmd(cmd)
         if result != "":
@@ -1315,15 +1523,20 @@ class HumanMonitor(Monitor):
                                                  (capability, result))
         return result
 
-    def get_migrate_capability(self, capability):
+    def get_migrate_capability(self, capability,
+                               disable_auto_x_evaluation=True):
         """
         Get the state of migrate-capability.
 
         :param capability: capability which need to get.
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          feature with/without "x-" prefix
         :raise MonitorNotSupportedMigCapError: if the capability is unknown
         :return: the state of migrate-capability.
         """
         capability_info = self.query("migrate_capabilities")
+        capability = self._get_migrate_capability(capability,
+                                                  disable_auto_x_evaluation)
         pattern = r"%s:\s+(on|off)" % capability
         match = re.search(pattern, capability_info, re.M)
         if match is None:
@@ -1351,7 +1564,19 @@ class HumanMonitor(Monitor):
         value = cache_size_info.split(":")[1].split()[0].strip()
         return value
 
-    def set_migrate_parameter(self, parameter, value):
+    def _get_migrate_parameter(self, parameter, error_on_missing=False,
+                               disable_auto_x_evaluation=True):
+        if self._supported_migrate_parameters is None:
+            params = []
+            for line in self.query("migrate_parameters").splitlines():
+                split = line.split(':', 1)
+                if len(split) == 2:
+                    params.append(split[0])
+            self._supported_migrate_parameters = params
+        return super(HumanMonitor, self)._get_migrate_parameter(
+            parameter, error_on_missing, disable_auto_x_evaluation)
+
+    def set_migrate_parameter(self, parameter, value, error_on_missing=False):
         """
         Set parameters of migrate.
 
@@ -1360,19 +1585,24 @@ class HumanMonitor(Monitor):
         """
         cmd = "migrate_set_parameter"
         self.verify_supported_cmd(cmd)
+        parameter = self._get_migrate_parameter(parameter, error_on_missing)
         cmd += " %s %s" % (parameter, value)
         return self.cmd(cmd)
 
-    def get_migrate_parameter(self, parameter):
+    def get_migrate_parameter(self, parameter, disable_auto_x_evaluation=True):
         """
         Get the parameter value. e.g. cpu-throttle-initial: 30
 
         :param parameter: the parameter which need to get
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          param with/without "x-" prefix
         """
-        parameter_info = self.query("migrate_parameters")
-        parameter_info = parameter_info.split(" ")
-        value = parameter_info[parameter_info.index("parameter")+1]
-        return value
+        parameter = self._get_migrate_parameter(parameter,
+                                                disable_auto_x_evaluation=disable_auto_x_evaluation)
+        for line in self.query("migrate_parameters").splitlines():
+            split = line.split(':', 1)
+            if split[0] == parameter:
+                return split[1].lstrip()
 
     def migrate_start_postcopy(self):
         """
@@ -1412,7 +1642,6 @@ class HumanMonitor(Monitor):
 
 
 class QMPMonitor(Monitor):
-
     """
     Wraps QMP monitor commands.
     """
@@ -1441,7 +1670,7 @@ class QMPMonitor(Monitor):
                 fails.  See cmd()'s docstring.
         """
         try:
-            Monitor.__init__(self, vm, name, filename)
+            super(QMPMonitor, self).__init__(vm, name, filename)
 
             self.protocol = "qmp"
             self._greeting = None
@@ -1617,6 +1846,7 @@ class QMPMonitor(Monitor):
         :param resp: Response from monitor command.
         :param debug: Whether to print the commands.
         """
+
         def _log_output(o, indent=0):
             logging.debug("(monitor %s.%s)    %s%s",
                           self.vm.name, self.name, " " * indent, o)
@@ -1714,6 +1944,14 @@ class QMPMonitor(Monitor):
 
         finally:
             self._lock.release()
+
+    @staticmethod
+    def _build_args(**kargs):
+        """
+        Build args used in cmd.
+        """
+        return {k.replace("_", "-"): v
+                for k, v in kargs.items() if v is not None}
 
     def cmd_raw(self, data, timeout=CMD_TIMEOUT):
         """
@@ -2024,7 +2262,8 @@ class QMPMonitor(Monitor):
         """
         return self.human_monitor_cmd("sendkey %s %s" % (keystr, hold_time))
 
-    def migrate(self, uri, full_copy=False, incremental_copy=False, wait=False):
+    def migrate(self, uri, full_copy=False,
+                incremental_copy=False, wait=False):
         """
         Migrate.
 
@@ -2117,7 +2356,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device}
         if speed is not None:
@@ -2142,7 +2381,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device}
         if speed:
@@ -2165,7 +2404,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device,
                 "speed": speed}
@@ -2181,7 +2420,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device}
         return self.cmd(cmd, args)
@@ -2196,7 +2435,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device}
         return self.cmd(cmd, args)
@@ -2211,7 +2450,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device}
         return self.cmd(cmd, args)
@@ -2231,6 +2470,16 @@ class QMPMonitor(Monitor):
         except Exception:
             job = dict()
         return job
+
+    def query_jobs(self):
+        """Query block job info """
+        return self.query("jobs")
+
+    def query_named_block_nodes(self):
+        """Query named block nodes info"""
+        cmd = "query-named-block-nodes"
+        self.verify_supported_cmd(cmd)
+        return self.cmd(cmd)
 
     def get_backingfile(self, device):
         """
@@ -2275,7 +2524,7 @@ class QMPMonitor(Monitor):
         :return: The command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device,
                 "target": target}
@@ -2300,7 +2549,7 @@ class QMPMonitor(Monitor):
         :return: the command's output
         """
         if correct:
-            cmd = self.correct(cmd)
+            cmd = self.get_workable_cmd(cmd)
         self.verify_supported_cmd(cmd)
         args = {"device": device}
         if cmd.startswith("__"):
@@ -2354,16 +2603,22 @@ class QMPMonitor(Monitor):
         """
         return self.cmd("inject-nmi")
 
-    def block_resize(self, device, size):
+    def block_resize(self, device, size, node_name=None):
         """
-        Resize the block device size
+        Resize the block device size.
 
-        :param device: Block device name
+        :param device: Block device name.
         :param size: Block device size need to set to. Unit is bytes.
-        :return: Command output
+        :param node_name: Graph node name to get the image resized.
+        :return: The response to the command.
         """
-        cmd = "block_resize device=%s,size=%s" % (device, size)
-        return self.send_args_cmd(cmd)
+        cmd = 'block_resize '
+        option = ['device', 'node-name', 'size']
+        value = [device, node_name, size]
+        for opt, val in zip(option, value):
+            if val is not None:
+                cmd += "{}={},".format(opt, val)
+        return self.send_args_cmd(cmd.rstrip(','))
 
     def eject_cdrom(self, device, force=False):
         """
@@ -2382,6 +2637,162 @@ class QMPMonitor(Monitor):
         self.verify_supported_cmd(cmd)
         args = {"device": device, "target": target}
         return self.cmd(cmd, args)
+
+    def blockdev_open_tray(self, dev_id, force=None):
+        """
+        Opens a block device's tray. If there is a block driver state tree
+        inserted as a medium, it will become inaccessible to the guest (but
+        it will remain associated to the block device, so closing the tray
+        will make it accessible again).
+
+        :param dev_id: The name or QOM path of the guest device.
+        :type dev_id: str
+        :param force: If false, an eject request will be sent to the guest if
+                      it has locked the tray (and the tray will not be opened
+                      immediately); if true, the tray will be opened regardless
+                      of whether it is locked.
+        :type force: bool
+        :return: The response of command.
+        """
+        cmd = "blockdev-open-tray"
+        self.verify_supported_cmd(cmd)
+        args = {"id": dev_id}
+        if force is not None:
+            args["force"] = force
+        return self.cmd(cmd, args)
+
+    def blockdev_close_tray(self, dev_id):
+        """
+        Closes a block device's tray. If there is a block driver state tree
+        associated with the block device (which is currently ejected), that
+        tree will be loaded as the medium.If the tray was already closed
+        before, this will be a no-op.
+
+        :param dev_id: The name or QOM path of the guest device.
+        :type dev_id: str
+        :return: The response of command.
+        """
+        cmd = "blockdev-close-tray"
+        self.verify_supported_cmd(cmd)
+        args = {"id": dev_id}
+        return self.cmd(cmd, args)
+
+    def blockdev_remove_medium(self, dev_id):
+        """
+        Removes a medium (a block driver state tree) from a block device. That
+        block device's tray must currently be open (unless there is no attached
+        guest device).
+
+        :param dev_id: The name or QOM path of the guest device.
+        :type dev_id: str
+        :return: The response of command.
+        """
+        cmd = "blockdev-remove-medium"
+        self.verify_supported_cmd(cmd)
+        args = {"id": dev_id}
+        return self.cmd(cmd, args)
+
+    def blockdev_insert_medium(self, dev_id, node_name):
+        """
+        Inserts a medium (a block driver state tree) into a block device. That
+        block device's tray must currently be open (unless there is no attached
+        guest device) and there must be no medium inserted already.
+
+        :param dev_id: The name or QOM path of the guest device.
+        :type dev_id: str
+        :param node_name: The name of a node in the block driver state graph.
+        :type node_name: str
+        :return: The response of command.
+        """
+        cmd = "blockdev-insert-medium"
+        self.verify_supported_cmd(cmd)
+        args = {"id": dev_id, "node-name": node_name}
+        return self.cmd(cmd, args)
+
+    def blockdev_change_medium(self, dev_id, filename, fmt=None, mode=None):
+        """
+        Changes the medium inserted into a block device by ejecting the current
+        medium and loading a new image file which is inserted as the new medium
+        (this command combines blockdev-open-tray, blockdev-remove-medium,
+        blockdev-insert-medium and blockdev-close-tray).
+
+        :param dev_id: The name or QOM path of the guest device.
+        :type dev_id: str
+        :param filename: The filename of the new image to be loaded.
+        :type filename: str
+        :param fmt: The format to open the new image.
+        :type fmt: str
+        :param mode: Change the read-only mode of the device.
+        :type mode: str
+        :return: The response of command.
+        """
+        cmd = "blockdev-change-medium"
+        self.verify_supported_cmd(cmd)
+        args = {"id": dev_id, "filename": filename}
+        if fmt is not None:
+            args["format"] = fmt
+        if mode is not None:
+            args["read-only-mode"] = mode
+        return self.cmd(cmd, args)
+
+    def blockdev_create(self, job_id, options):
+        """
+        Create block device image file by qemu
+
+        :param kwargs: dictionary containing required parameters
+        :return: block job ID
+        :rtype: string
+        """
+        cmd = "blockdev-create"
+        self.verify_supported_cmd(cmd)
+        arguments = {"job-id": job_id, "options": options}
+        return self.cmd(cmd, arguments)
+
+    def blockdev_add(self, props):
+        """
+        Creates a new block device.
+
+        :param props: Dictionary with the blockdev-add parameters
+                      (property of block device).
+        :type props: dict
+        :return: The response of command.
+        """
+        cmd = "blockdev-add"
+        self.verify_supported_cmd(cmd)
+        return self.cmd(cmd, props)
+
+    def blockdev_del(self, node_name):
+        """
+        Deletes a block device that has been added using blockdev-add.
+        The command will fail if the node is attached to a device or is
+        otherwise being used.
+
+        :param node_name: Name of the graph node to delete.
+        :type node_name: str
+        :return: The response of command.
+        """
+        cmd = "blockdev-del"
+        self.verify_supported_cmd(cmd)
+        args = {"node-name": node_name}
+        return self.cmd(cmd, args)
+
+    def blockdev_backup(self, options):
+        """
+        Backup block device via QMP command blockdev-backup
+
+        :param kwargs: dictionary containing required parameters
+        :return: block job ID
+        :rtype: string
+        """
+        cmd = "blockdev-backup"
+        self.verify_supported_cmd(cmd)
+        return self.cmd(cmd, options)
+
+    def job_dismiss(self, identifier):
+        """Dismiss a block job"""
+        cmd = "job-dismiss"
+        self.verify_supported_cmd(cmd)
+        return self.cmd(cmd, {"id": identifier})
 
     def qom_set(self, path, qproperty, qvalue):
         """
@@ -2428,14 +2839,28 @@ class QMPMonitor(Monitor):
             raise QMPEventError(cmd, qmp_event, self.vm.name, self.name)
         logging.info("%s QMP event received" % qmp_event)
 
-    def set_migrate_capability(self, state, capability):
+    def _get_migrate_capability(self, capability,
+                                disable_auto_x_evaluation=True):
+        if self._supported_migrate_capabilities is None:
+            ret = self.query("migrate-capabilities")
+            self._supported_migrate_capabilities = set(_["capability"]
+                                                       for _ in ret)
+        return super(QMPMonitor, self)._get_migrate_capability(capability,
+                                                               disable_auto_x_evaluation)
+
+    def set_migrate_capability(self, state, capability,
+                               disable_auto_x_evaluation=True):
         """
         Set the capability of migrate to state.
 
         :param state: Bool value of capability.
         :param capability: capability which need to set.
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          feature with/without "x-" prefix
         :raise MonitorNotSupportedMigCapError: if the capability is unsettable
         """
+        capability = self._get_migrate_capability(capability,
+                                                  disable_auto_x_evaluation)
         cmd = "migrate-set-capabilities"
         self.verify_supported_cmd(cmd)
         args = {"capabilities": [{"state": state, "capability": capability}]}
@@ -2444,23 +2869,42 @@ class QMPMonitor(Monitor):
         # clear if it's another reason for the error
         try:
             return self.cmd(cmd, args)
-        except QMPCmdError as e:
-            if e.data['class'] in ['GenericError']:
-                logging.debug(
-                    "Error in set_migrate_capability for %s: %s" % (capability, e))
-                raise MonitorNotSupportedMigCapError("set capability failed for %s (%s)" %
-                                                     (capability, e))
-            else:
-                raise e
+        except QMPCmdError as exc:
+            if disable_auto_x_evaluation:
+                raise
+            # Try it again with/without "x-" prefix
+            capability2 = x_non_x_feature(capability)
+            args = {"capabilities": [{"state": state,
+                                      "capability": capability2}]}
+            try:
+                return self.cmd(cmd, args)
+            except QMPCmdError as exc2:
+                logging.debug("Error in set_migrate_capability for %s: %s",
+                              capability, exc)
+                logging.debug("Error in set_migrate_capability for %s: "
+                              "%s", capability2, exc2)
+                if exc.data['class'] == exc2.data['class'] == 'GenericError':
+                    msg = ("set capability failed for %s (%s) as well as %s "
+                           "(%s)" % (capability, exc, capability2, exc2))
+                    raise MonitorNotSupportedMigCapError(msg)
+                else:   # raise the non-generic-error exception
+                    if exc.data['class'] == 'GenericError':
+                        raise exc2
+                    else:
+                        raise exc
 
-    def get_migrate_capability(self, capability):
+    def get_migrate_capability(self, capability,
+                               disable_auto_x_evaluation=True):
         """
         Get the state of migrate-capability.
 
         :param capability: capability which need to get.
         :return: the state of migrate-capability.
+        :note: automatically checks for "x-"/non-"x-" variant of the cap.
         :raise MonitorNotSupportedMigCapError: if the capability is unknown
         """
+        capability = self._get_migrate_capability(capability,
+                                                  disable_auto_x_evaluation)
         capability_infos = self.query("migrate-capabilities")
         for item in capability_infos:
             if item["capability"] == capability:
@@ -2485,29 +2929,46 @@ class QMPMonitor(Monitor):
         """
         return self.query("migrate-cache-size")
 
-    def set_migrate_parameter(self, parameter, value):
+    def _get_migrate_parameter(self, parameter, error_on_missing=False,
+                               disable_auto_x_evaluation=True):
+        if self._supported_migrate_parameters is None:
+            ret = self.query("migrate-parameters")
+            self._supported_migrate_parameters = ret.keys()
+        return super(QMPMonitor, self)._get_migrate_parameter(parameter,
+                                                              error_on_missing,
+                                                              disable_auto_x_evaluation)
+
+    def set_migrate_parameter(self, parameter, value, error_on_missing=False,
+                              disable_auto_x_evaluation=True):
         """
         Set the parameters of migrate.
 
         :param parameter: the parameter which need to set.
         :param value: the value of parameter
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          param with/without "x-" prefix
         """
         cmd = "migrate-set-parameters"
         self.verify_supported_cmd(cmd)
+        parameter = self._get_migrate_parameter(parameter, error_on_missing,
+                                                disable_auto_x_evaluation)
         args = {parameter: value}
         return self.cmd(cmd, args)
 
-    def get_migrate_parameter(self, parameter):
+    def get_migrate_parameter(self, parameter, disable_auto_x_evaluation=True):
         """
         Get the value of parameter.
 
         :param parameter: parameter which need to get.
+        :param disable_auto_x_evaluation: Whether to automatically choose
+                                          param with/without "x-" prefix
         """
         parameter_info = self.query("migrate-parameters")
+        parameter = self._get_migrate_parameter(parameter,
+                                                disable_auto_x_evaluation=disable_auto_x_evaluation)
         if parameter in parameter_info:
             return parameter_info[parameter]
-        else:
-            return False
+        return False
 
     def get_migrate_progress(self):
         """
@@ -2532,7 +2993,8 @@ class QMPMonitor(Monitor):
                 logging.debug("Migration progress: 0%")
                 return 0
             else:
-                raise MonitorError("Unable to parse migration progress:\n%s" % status)
+                raise MonitorError(
+                    "Unable to parse migration progress:\n%s" % status)
 
     def migrate_start_postcopy(self):
         """
@@ -2572,16 +3034,155 @@ class QMPMonitor(Monitor):
         """
         Add, remove or clear a dirty bitmap.
 
+        NOTE: this method is deprecated, please use corresponding dedicated
+              methods:
+              block_dirty_bitmap_add
+              block_dirty_bitmap_remove
+              block_dirty_bitmap_clear
+              block_dirty_bitmap_enable
+              block_dirty_bitmap_disable
+
         :param operation: operations to bitmap, can be 'add', 'remove', and 'clear'
         :param node: device/node on which to operate dirty bitmap
         :param name: name of the dirty bitmap to operate
         :param granularity: granularity to track writes with
         """
         cmd = "block-dirty-bitmap-%s" % operation
+        if not self._has_command(cmd):
+            cmd += "x-"
+        return self._operate_dirty_bitmap(cmd, node, name,
+                                          granularity=granularity)
+
+    def _operate_dirty_bitmap(self, cmd, node, name, **kargs):
+        """
+        Operate dirty bitmap.
+
+        :param cmd: command to operate bitmap
+        :param node: device node
+        :param name: name of the dirty bitmap to operate
+        """
         self.verify_supported_cmd(cmd)
         args = {"node": node, "name": name}
-        if operation == "add":
-            args["granularity"] = granularity
+        args.update(self._build_args(**kargs))
+        return self.cmd(cmd, args)
+
+    def block_dirty_bitmap_add(self, node, name, disabled=None,
+                               granularity=None, persistent=None):
+        """
+        Add a dirty bitmap.
+
+        :param node: device node
+        :param name: bitmap name
+        :param disabled: bitmap created in disabled state
+        :param granularity: segment size
+        :param persistent: persistent through QEMU shutdown
+        """
+        kwargs = {"granularity": granularity,
+                  "disabled": disabled,
+                  "persistent": persistent}
+        cmd = "block-dirty-bitmap-add"
+        try:
+            return self._operate_dirty_bitmap(cmd, node, name, **kwargs)
+        except QMPCmdError as e:
+            if "'disabled' is unexpected" in str(e):
+                kwargs["x-disabled"] = kwargs.pop("disabled")
+            else:
+                raise e
+        return self._operate_dirty_bitmap(cmd, node, name, **kwargs)
+
+    def block_dirty_bitmap_remove(self, node, name):
+        """
+        Remove a dirty bitmap.
+        """
+        cmd = "block-dirty-bitmap-remove"
+        return self._operate_dirty_bitmap(cmd, node, name)
+
+    def block_dirty_bitmap_clear(self, node, name):
+        """
+        Reset a dirty bitmap.
+        """
+        cmd = "block-dirty-bitmap-clear"
+        return self._operate_dirty_bitmap(cmd, node, name)
+
+    def block_dirty_bitmap_merge(self, node, src_bitmaps, dst_bitmap):
+        """
+        Merge source bitmaps into target bitmap in node
+
+        :param node: device ID or node-name
+        :param src_bitmaps: source bitmap list
+        :param dst_bitmap: target bitmap name
+        """
+        cmd = "block-dirty-bitmap-merge"
+        self.verify_supported_cmd(cmd)
+        args = {"node": node, "bitmaps": src_bitmaps, "target": dst_bitmap}
+        return self.cmd(cmd, args)
+
+    def x_block_dirty_bitmap_merge(self, node, src_bitmap, dst_bitmap):
+        """
+        Merge source bitmaps to target bitmap for given node
+
+        :param string node: block device node name
+        :parma list src_bitmaps: list of source bitmaps
+        :param string dst_bitmap: target bitmap name
+        :raise: MonitorNotSupportedCmdError if 'block-dirty-bitmap-mege' and
+                'x-block-dirty-bitmap-mege' commands not supported by QMP
+                monitor.
+        """
+        cmd = "x-block-dirty-bitmap-merge"
+        self.verify_supported_cmd(cmd)
+        args = {"node": node, "src_name": src_bitmap, "dst_name": dst_bitmap}
+        return self.cmd(cmd, args)
+
+    def block_dirty_bitmap_enable(self, node, name):
+        """
+        Enable a dirty bitmap.
+        """
+        cmd = "block-dirty-bitmap-enable"
+        return self._operate_dirty_bitmap(cmd, node, name)
+
+    def x_block_dirty_bitmap_enable(self, node, name):
+        """
+        Enable a dirty bitmap.
+        """
+        cmd = "x-block-dirty-bitmap-enable"
+        return self._operate_dirty_bitmap(cmd, node, name)
+
+    def block_dirty_bitmap_disable(self, node, name):
+        """
+        Disable a dirty bitmap.
+        """
+        cmd = "block-dirty-bitmap-disable"
+        return self._operate_dirty_bitmap(cmd, node, name)
+
+    def x_block_dirty_bitmap_disable(self, node, name):
+        """
+        Disable a dirty bitmap.
+        """
+        cmd = "x-block-dirty-bitmap-disable"
+        return self._operate_dirty_bitmap(cmd, node, name)
+
+    def debug_block_dirty_bitmap_sha256(self, node, bitmap):
+        """
+        get sha256 of bitmap
+
+        :param string node: node name
+        :param string bitmap: bitmap name
+        """
+        cmd = "debug-block-dirty-bitmap-sha256"
+        self.verify_supported_cmd(cmd)
+        args = {"node": node, "name": bitmap}
+        return self.cmd(cmd, args)
+
+    def x_debug_block_dirty_bitmap_sha256(self, node, bitmap):
+        """
+        get sha256 of bitmap
+
+        :param string node: node name
+        :param string bitmap: bitmap name
+        """
+        cmd = "x-debug-block-dirty-bitmap-sha256"
+        self.verify_supported_cmd(cmd)
+        args = {"node": node, "name": bitmap}
         return self.cmd(cmd, args)
 
     def drive_backup(self, device, target, format, sync, speed=0,
@@ -2638,3 +3239,22 @@ class QMPMonitor(Monitor):
                     "data": key
                 }}}]}
         return self.cmd(cmd, args)
+
+    def input_send_event(self, events, device=None, head=None):
+        """
+        Send input event(s) to guest.
+
+        :param device: display device to send event(s) to.
+        :param head: head to send event(s) to, in case the
+                     display device supports multiple scanouts.
+        :param events: List of InputEvent union.
+        """
+        cmd = "input-send-event"
+        self.verify_supported_cmd(cmd)
+        arguments = dict()
+        if device:
+            arguments["device"] = device
+        if head:
+            arguments["head"] = int(head)
+        arguments["events"] = events
+        return self.cmd(cmd, arguments)

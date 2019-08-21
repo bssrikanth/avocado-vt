@@ -24,6 +24,7 @@ from avocado.utils import distro
 from avocado.core import exceptions
 
 from virttest import data_dir
+from virttest import kernel_interface
 from virttest import error_context
 from virttest import utils_misc
 from virttest import versionable_class
@@ -32,6 +33,7 @@ from virttest import remote
 from virttest import utils_libvirtd
 from virttest import utils_net
 from virttest import utils_config
+from virttest import kernel_interface
 from virttest.staging import service
 from virttest.staging import utils_memory
 from virttest.compat_52lts import results_stderr_52lts, decode_to_text
@@ -205,13 +207,14 @@ class SetupManager(object):
 
 class TransparentHugePageConfig(object):
 
-    def __init__(self, test, params):
+    def __init__(self, test, params, session=None):
         """
         Find paths for transparent hugepages and kugepaged configuration. Also,
         back up original host configuration so it can be restored during
         cleanup.
         """
         self.params = params
+        self.session = session
 
         RH_THP_PATH = "/sys/kernel/mm/redhat_transparent_hugepage"
         UPSTREAM_THP_PATH = "/sys/kernel/mm/transparent_hugepage"
@@ -243,22 +246,20 @@ class TransparentHugePageConfig(object):
             base_dir = f[0]
             if f[2]:
                 for name in f[2]:
-                    f_dir = os.path.join(base_dir, name)
-                    with open(f_dir, 'r') as param_f:
-                        parameter = param_f.read()
-                    logging.debug("Reading path %s: %s", f_dir,
-                                  parameter.strip())
+                    f_dir = kernel_interface.SysFS(os.path.join(base_dir, name),
+                                                   session=self.session)
+                    parameter = str(f_dir.sys_fs_value).strip("[]")
+                    logging.debug("Reading path %s: %s", f_dir.sys_fs,
+                                  parameter)
                     try:
                         # Verify if the path in question is writable
-                        f = open(f_dir, 'w')
+                        f = open(f_dir.sys_fs, 'w')
                         f.close()
-                        if re.findall("\[(.*)\]", parameter):
-                            original_config[f_dir] = re.findall("\[(.*)\]",
-                                                                parameter)[0]
-                            self.file_list_str.append(f_dir)
+                        original_config[f_dir.sys_fs] = parameter
+                        if isinstance(parameter, str):
+                            self.file_list_str.append(f_dir.sys_fs)
                         else:
-                            original_config[f_dir] = int(parameter)
-                            self.file_list_num.append(f_dir)
+                            self.file_list_num.append(f_dir.sys_fs)
                     except IOError:
                         pass
 
@@ -274,18 +275,8 @@ class TransparentHugePageConfig(object):
             for path in list(self.test_config.keys()):
                 logging.info("Writing path %s: %s", path,
                              self.test_config[path])
-                with open(path, 'w') as cfg_f:
-                    cfg_f.write(self.test_config[path])
-
-    def value_listed(self, value):
-        """
-        Get a parameters list from a string
-        """
-        value_list = []
-        for i in re.split("\[|\]|\n+|\s+", value):
-            if i:
-                value_list.append(i)
-        return value_list
+                cfg_f = kernel_interface.SysFS(path, session=self.session)
+                cfg_f.sys_fs_value = self.test_config[path]
 
     def khugepaged_test(self):
         """
@@ -298,52 +289,36 @@ class TransparentHugePageConfig(object):
             for (act, ret) in action_list:
                 logging.info("Writing path %s: %s, expected khugepage rc: %s ",
                              file_name, act, ret)
+                khugepage = kernel_interface.SysFS(file_name, session=self.session)
+                khugepage.sys_fs_value = act
                 try:
-                    file_object = open(file_name, "w")
-                    file_object.write(act)
-                    file_object.close()
-                except IOError as error_detail:
-                    logging.info("IO Operation on path %s failed: %s",
-                                 file_name, error_detail)
-                timeout = time.time() + 50
-                while time.time() < timeout:
-                    try:
-                        process.run('pgrep khugepaged', verbose=False)
-                        if ret != 0:
-                            time.sleep(1)
-                            continue
-                    except process.CmdError:
-                        if ret == 0:
-                            time.sleep(1)
-                            continue
-                    break
-                else:
-                    if ret != 0:
-                        raise THPKhugepagedError("Khugepaged still alive when"
-                                                 "transparent huge page is "
-                                                 "disabled")
-                    else:
-                        raise THPKhugepagedError("Khugepaged could not be set to"
-                                                 "status %s" % act)
-
+                    ret_val = process.system('pgrep khugepaged', shell=True,
+                                             verbose=False)
+                    if ret_val != ret:
+                        raise THPKhugepagedError("Khugepaged could not be set "
+                                                 "to expected status %s, "
+                                                 "instead actual status is %s "
+                                                 "for action %s" %
+                                                 (ret, ret_val, act))
+                except process.CmdError:
+                    raise THPKhugepagedError("Khugepaged still alive when"
+                                             "transparent huge page is "
+                                             "disabled")
         logging.info("Testing khugepaged")
         for file_path in self.file_list_str:
             action_list = []
-            if re.findall("enabled", file_path):
+            thp = kernel_interface.SysFS(file_path, session=self.session)
+            value_list = [each.strip("[]") for each in thp.fs_value.split()]
+            if re.match("enabled", file_path):
                 # Start and stop test for khugepaged
-                value_list = self.value_listed(open(file_path, "r").read())
                 for i in value_list:
-                    if re.match("n", i, re.I):
+                    if thp.sys_fs_value == "never":
                         action_stop = (i, 256)
-                for i in value_list:
-                    if re.match("[^n]", i, re.I):
                         action = (i, 0)
                         action_list += [action_stop, action, action_stop]
                 action_list += [action]
-
                 check_status_with_value(action_list, file_path)
             else:
-                value_list = self.value_listed(open(file_path, "r").read())
                 for i in value_list:
                     action = (i, 0)
                     action_list.append(action)
@@ -351,10 +326,8 @@ class TransparentHugePageConfig(object):
 
         for file_path in self.file_list_num:
             action_list = []
-            file_object = open(file_path, "r")
-            value = file_object.read()
-            value = int(value)
-            file_object.close()
+            file_object = kernel_interface.SysFS(file_path, session=self.session)
+            value = file_object.sys_fs_value
             if value != 0 and value != 1:
                 new_value = random.random()
                 action_list.append((str(int(value * new_value)), 0))
@@ -381,13 +354,8 @@ class TransparentHugePageConfig(object):
         for path in self.original_config:
             logging.info("Writing path %s: %s", path,
                          self.original_config[path])
-            try:
-                p_file = open(path, 'w')
-                p_file.write(str(self.original_config[path]))
-                p_file.close()
-            except IOError as error_detail:
-                logging.info("IO operation failed on file %s: %s", path,
-                             error_detail)
+            p_file = kernel_interface.SysFS(path, session=self.session)
+            p_file.sys_fs_value = str(self.original_config[path])
 
 
 class HugePageConfig(object):
@@ -409,6 +377,8 @@ class HugePageConfig(object):
             self.kernel_hp_file = '/proc/sys/vm/nr_hugepages'
         else:
             raise exceptions.TestSkipError("System doesn't support hugepages")
+        self.over_commit_hp = "/proc/sys/vm/nr_overcommit_hugepages"
+        self.over_commit = kernel_interface.ProcFS(self.over_commit_hp)
         self.pool_path = "/sys/kernel/mm/hugepages"
         self.sys_node_path = "/sys/devices/system/node"
         # Unit is KB as default for hugepage size.
@@ -429,7 +399,15 @@ class HugePageConfig(object):
         self.hugepage_force_allocate = params.get("hugepage_force_allocate",
                                                   "no")
         self.suggest_mem = None
-        self.lowest_mem_per_vm = int(params.get("lowest_mem", "256"))
+        normalize_data_size = utils_misc.normalize_data_size
+        vm_mem_minimum = params.get("vm_mem_minimum", "512M")
+        self.lowest_mem_per_vm = float(normalize_data_size(vm_mem_minimum))
+        utils_memory.drop_caches()
+        self.ext_hugepages_surp = utils_memory.get_num_huge_pages_surp()
+
+        overcommit_hugepages = int(params.get("overcommit_hugepages", 0))
+        if overcommit_hugepages != self.over_commit.proc_fs_value:
+            self.over_commit.proc_fs_value = overcommit_hugepages
 
         target_hugepages = params.get("target_hugepages")
         if target_hugepages is None:
@@ -437,7 +415,8 @@ class HugePageConfig(object):
         else:
             target_hugepages = int(target_hugepages)
 
-        self.target_hugepages = target_hugepages
+        self.target_hugepages = (target_hugepages + self.ext_hugepages_surp -
+                                 overcommit_hugepages)
         self.target_nodes = params.get("target_nodes")
         if self.target_nodes:
             self.target_node_num = {}
@@ -447,12 +426,12 @@ class HugePageConfig(object):
                 num = params.object_params("node%s" % node).get("target_num")
                 # let us distribute the hugepages if target_num_node is not set
                 if not num:
-                    num = self.target_hugepages / self.node_len
+                    num = self.target_hugepages // self.node_len
                     if node == self.node_list[0]:
                         # if target_hugepages is not divisible by node_len
                         # add remainder it to first node
                         num += self.target_hugepages % self.node_len
-                self.target_node_num[node] = num
+                self.target_node_num[node] = int(num)
 
     @error_context.context_aware
     def check_hugepage_support(self):
@@ -488,7 +467,8 @@ class HugePageConfig(object):
         """
         Get the current system setting for huge memory page size.
         """
-        meminfo = open('/proc/meminfo', 'r').readlines()
+        with open('/proc/meminfo', 'r') as meminfo_fd:
+            meminfo = meminfo_fd.readlines()
         huge_line_list = [h for h in meminfo if h.startswith("Hugepagesize")]
         try:
             return int(huge_line_list[0].split()[1])
@@ -518,9 +498,8 @@ class HugePageConfig(object):
             self.hugepage_force_allocate = "yes"
 
         if self.hugepage_force_allocate == "no":
-            hugepage_allocated = open(self.kernel_hp_file, "r")
-            available_hugepages = int(hugepage_allocated.read().strip())
-            hugepage_allocated.close()
+            with open(self.kernel_hp_file, "r") as hugepage_allocated:
+                available_hugepages = int(hugepage_allocated.read().strip())
             chunk_bottom = int(math.log(self.hugepage_size / utils_memory.getpagesize(), 2))
             if ARCH == 'ppc64le':
                 chunk_info = utils_memory.get_buddy_info(">=%s" % chunk_bottom)
@@ -574,21 +553,51 @@ class HugePageConfig(object):
             raise ValueError("Root hugepage control sysfs directory %s did not"
                              " exist" % self.pool_path)
 
-    def get_node_num_huge_pages(self, node, pagesize):
+    def get_kernel_hugepages(self, pagesize):
+        """
+        Get specific hugepages number allocated by kernel at runtime
+        read page number from
+        /sys/kernel/mm/hugepages/hugepages-${pagesize}kB/nr_hugepages
+
+        :param pagesize: string or int, page size in kB
+        :return: page number
+        """
+        pgfile = "%s/hugepages-%skB/nr_hugepages" % (self.pool_path, pagesize)
+
+        obj = kernel_interface.SysFS(pgfile)
+        return obj.sys_fs_value
+
+    def set_kernel_hugepages(self, pagesize, pagenum):
+        """
+        Let kernel allocate some specific hugepages at runtime
+        write page number to
+        /sys/kernel/mm/hugepages/hugepages-${pagesize}kB/nr_hugepages
+
+        :param pagesize: string or int, page size in kB
+        :param pagenum: page number
+        """
+        pgfile = "%s/hugepages-%skB/nr_hugepages" % (self.pool_path, pagesize)
+
+        obj = kernel_interface.SysFS(pgfile)
+        obj.sys_fs_value = pagenum
+
+    def get_node_num_huge_pages(self, node, pagesize, type="total"):
         """
         Get number of pages of certain page size under given numa node.
 
         :param node: string or int, node number
         :param pagesize: string or int, page size in kB
+        :param type: total pages or free pages
         :return: int, node huge pages number of given page size
         """
+        if type == 'free':
+            ptype = "free_hugepages"
+        else:
+            ptype = "nr_hugepages"
         node_page_path = "%s/node%s" % (self.sys_node_path, node)
-        node_page_path += "/hugepages/hugepages-%skB/nr_hugepages" % pagesize
-        if not os.path.isfile(node_page_path):
-            raise ValueError("%s page size nr_hugepages file of node %s did "
-                             "not exist" % (pagesize, node))
-        out = decode_to_text(process.system_output("cat %s" % node_page_path))
-        return int(out)
+        node_page_path += "/hugepages/hugepages-%skB/%s" % (pagesize, ptype)
+        obj = kernel_interface.SysFS(node_page_path)
+        return obj.sys_fs_value
 
     def set_node_num_huge_pages(self, num, node, pagesize):
         """
@@ -600,10 +609,12 @@ class HugePageConfig(object):
         """
         node_page_path = "%s/node%s" % (self.sys_node_path, node)
         node_page_path += "/hugepages/hugepages-%skB/nr_hugepages" % pagesize
-        if not os.path.isfile(node_page_path):
-            raise ValueError("%s page size nr_hugepages file of node %s did "
-                             "not exist" % (pagesize, node))
-        process.system("echo %s > %s" % (num, node_page_path), shell=True)
+        obj = kernel_interface.SysFS(node_page_path)
+        obj.sys_fs_value = num
+        # If node has some used hugepage, result will be larger than expected.
+        if obj.sys_fs_value < int(num):
+            raise ValueError("Cannot set %s hugepages on node %s, please check"
+                             " if the node has enough memory" % (num, node))
 
     @error_context.context_aware
     def set_hugepages(self):
@@ -613,20 +624,18 @@ class HugePageConfig(object):
         error_context.context(
             "setting hugepages limit to %s" % self.target_hugepages)
         try:
-            hugepage_cfg = open(self.kernel_hp_file, "r+")
-            hp = hugepage_cfg.readline().strip()
-            hugepage_cfg.close()
+            with open(self.kernel_hp_file, "r") as hugepage_cfg:
+                hp = hugepage_cfg.readline().strip()
         except IOError:
             raise exceptions.TestSetupFail("Can't read kernel hugepage file")
         while int(hp) < self.target_hugepages:
             loop_hp = hp
             try:
-                hugepage_cfg = open(self.kernel_hp_file, "r+")
-                hugepage_cfg.write(str(self.target_hugepages))
-                hugepage_cfg.flush()
-                hugepage_cfg.seek(0)
-                hp = int(hugepage_cfg.readline().strip())
-                hugepage_cfg.close()
+                with open(self.kernel_hp_file, "r+") as hugepage_cfg:
+                    hugepage_cfg.write(str(self.target_hugepages))
+                    hugepage_cfg.flush()
+                    hugepage_cfg.seek(0)
+                    hp = int(hugepage_cfg.readline().strip())
             except IOError:
                 msg = "Can't read/write from kernel hugepage file"
                 raise exceptions.TestSetupFail(msg)
@@ -657,8 +666,14 @@ class HugePageConfig(object):
         logging.debug("Amount of memory used by each vm: %s", self.mem)
         logging.debug("System setting for large memory page size: %s",
                       self.hugepage_size)
+        if self.over_commit.proc_fs_value > 0:
+            logging.debug("Number of overcommit large memory pages will be set"
+                          " for this test: %s", self.over_commit.proc_fs_value)
         logging.debug("Number of large memory pages needed for this test: %s",
                       self.target_hugepages)
+        # Drop caches to clean some usable memory
+        with open("/proc/sys/vm/drop_caches", "w") as caches:
+            caches.write('3')
         if self.target_nodes:
             for node, num in six.iteritems(self.target_node_num):
                 self.set_node_num_huge_pages(num, node, self.hugepage_size)
@@ -677,6 +692,8 @@ class HugePageConfig(object):
             except process.CmdError:
                 return
             process.system("echo 0 > %s" % self.kernel_hp_file, shell=True)
+            self.over_commit.proc_fs_value = 0
+            self.ext_hugepages_surp = utils_memory.get_num_huge_pages_surp()
             logging.debug("Hugepage memory successfully deallocated")
 
 
@@ -793,6 +810,14 @@ class PrivateBridgeConfig(object):
                 ports.append(u_port)
             self.iptables_rules = self._assemble_iptables_rules(ports)
             self.physical_nic = params.get("physical_nic")
+            if self.physical_nic:
+                if self.physical_nic.split(':', 1)[0] == "shell":
+                    self.physical_nic = decode_to_text(process.system_output(
+                        self.physical_nic.split(':', 1)[1], shell=True))
+                if self.physical_nic not in utils_net.get_host_iface():
+                    raise exceptions.TestSetupFail("Physical network '%s'"
+                                                   "does not exist" %
+                                                   self.physical_nic)
             self.force_create = False
             if params.get("bridge_force_create", "no") == "yes":
                 self.force_create = True
@@ -1863,22 +1888,23 @@ class LibvirtPolkitConfig(object):
         self.polkit_rules_path = "/etc/polkit-1/rules.d/"
         self.polkit_rules_path += "500-libvirt-acl-virttest.rules"
         self.polkit_name = "polkit"
+        self.params = params
         distro_obj = distro.detect()
         # For ubuntu polkitd have to be used
         if distro_obj.name.lower().strip() == 'ubuntu':
             self.polkit_name = "polkitd"
         self.polkitd = service.Factory.create_service(self.polkit_name)
 
-        if params.get("action_id"):
-            self.action_id = params.get("action_id").split()
+        if self.params.get("action_id"):
+            self.action_id = self.params.get("action_id").split()
         else:
             self.action_id = []
-        self.user = params.get("unprivileged_user")
-        if params.get("action_lookup"):
+        self.user = self.params.get("unprivileged_user")
+        if self.params.get("action_lookup"):
             # The action_lookup string should be separated by space and
             # each separated string should have ':' which represent key:value
             # for later use.
-            self.attr = params.get("action_lookup").split()
+            self.attr = self.params.get("action_lookup").split()
         else:
             self.attr = []
 
@@ -2006,12 +2032,14 @@ class LibvirtPolkitConfig(object):
         # Use 'testacl' if unprivileged_user in cfg contains string 'EXAMPLE',
         # and if user 'testacl' is not exist on host, create it for test.
         if self.user.count('EXAMPLE'):
-            cmd = "id testacl"
-            if process.system(cmd, ignore_status=True):
-                logging.debug("Create new user 'testacl' on host.")
-                cmd = "useradd testacl"
-                process.system(cmd, ignore_status=True)
             self.user = 'testacl'
+
+        cmd = "id %s" % self.user
+        if process.system(cmd, ignore_status=True):
+            self.params['add_polkit_user'] = 'yes'
+            logging.debug("Create new user '%s' on host." % self.user)
+            cmd = "useradd %s" % self.user
+            process.system(cmd, ignore_status=True)
         self._set_polkit_conf()
         # Polkit rule will take about 1 second to take effect after change.
         # Restart polkit daemon will force it immediately.
@@ -2027,9 +2055,12 @@ class LibvirtPolkitConfig(object):
             if os.path.exists(self.libvirtd_backup_path):
                 os.rename(self.libvirtd_backup_path, self.libvirtd_path)
             if self.user.count('EXAMPLE'):
-                logging.debug("Delete the created user 'testacl'.")
-                cmd = "userdel -r testacl"
+                self.user = 'testacl'
+            if self.params.get('add_polkit_user'):
+                logging.debug("Delete the created user '%s'." % self.user)
+                cmd = "userdel -r %s" % self.user
                 process.system(cmd, ignore_status=True)
+                del self.params['add_polkit_user']
         except Exception:
             raise PolkitConfigCleanupError("Failed to cleanup polkit config.")
 
@@ -2117,7 +2148,7 @@ class EGDConfig(object):
         return pid
 
     def setup(self):
-        backend = self.params["chardev_backend"]
+        backend = self.params["rng_chardev_backend"]
         backend_type = self.params["%s_type" % backend]
         path = "path_%s" % backend_type
         port = "port_%s" % backend_type
@@ -2225,9 +2256,9 @@ def remote_session(params):
     :param params: Test params dict for remote machine login details
     :return: remote session object
     """
-    server_ip = params["server_ip"]
-    server_user = params.get("server_user", "root")
-    server_pwd = params["server_pwd"]
+    server_ip = params.get("server_ip", params.get("remote_ip"))
+    server_user = params.get("server_user", params.get("remote_user"))
+    server_pwd = params.get("server_pwd", params.get("remote_pwd"))
     return remote.wait_for_login('ssh', server_ip, '22', server_user,
                                  server_pwd, r"[\#\$]\s*$")
 

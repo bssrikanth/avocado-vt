@@ -28,6 +28,8 @@ from virttest.qemu_devices.utils import (DeviceError, DeviceHotplugError,
                                          DeviceInsertError, DeviceRemoveError,
                                          DeviceUnplugError, none_or_int)
 from virttest.compat_52lts import results_stdout_52lts, decode_to_text
+from virttest.utils_params import Params
+from virttest.qemu_capabilities import Flags, Capabilities
 
 #
 # Device container (device representation of VM)
@@ -42,17 +44,35 @@ class DevContainer(object):
     """
     # General methods
 
+    cache_map = {'writeback': {'write-cache': 'on',
+                               'cache.direct': 'off',
+                               'cache.no-flush': 'off'},
+                 'none': {'write-cache': 'on',
+                          'cache.direct': 'on',
+                          'cache.no-flush': 'off'},
+                 'writethrough': {'write-cache': 'off',
+                                  'cache.direct': 'off',
+                                  'cache.no-flush': 'off'},
+                 'directsync': {'write-cache': 'off',
+                                'cache.direct': 'on',
+                                'cache.no-flush': 'off'},
+                 'unsafe': {'write-cache': 'on',
+                            'cache.direct': 'off',
+                            'cache.no-flush': 'on'}}
+
     def __init__(self, qemu_binary, vmname, strict_mode="no",
-                 workaround_qemu_qmp_crash="no", allow_hotplugged_vm="yes"):
+                 workaround_qemu_qmp_crash="no", allow_hotplugged_vm="yes",
+                 capabilities=None):
         """
         :param qemu_binary: qemu binary
         :param vm: related VM
         :param strict_mode: Use strict mode (set optional params)
+        :param capabilities: the capabilities of vm
         """
         def get_hmp_cmds(qemu_binary):
             """ :return: list of human monitor commands """
             _ = decode_to_text(process.system_output("echo -e 'help\nquit' | %s -monitor "
-                                                     "stdio -vnc none" % qemu_binary,
+                                                     "stdio -vnc none -S" % qemu_binary,
                                                      timeout=10, ignore_status=True,
                                                      shell=True, verbose=False))
             _ = re.findall(r'^([^()\|\[\sA-Z]+\|?\w+)', _, re.M)
@@ -73,7 +93,7 @@ class DevContainer(object):
                                                             '{ "execute": "qmp_capabilities" }\n'
                                                             '{ "execute": "query-commands", "id": "RAND91" }\n'
                                                             '{ "execute": "quit" }\''
-                                                            '| %s -qmp stdio -vnc none | grep return |'
+                                                            '| %s -qmp stdio -vnc none -S | grep return |'
                                                             ' grep RAND91' % qemu_binary, timeout=10,
                                                             ignore_status=True, shell=True,
                                                             verbose=False)).splitlines()
@@ -83,7 +103,7 @@ class DevContainer(object):
                                                             '{ "execute": "qmp_capabilities" }\n'
                                                             '{ "execute": "query-commands", "id": "RAND91" }\n'
                                                             '{ "execute": "quit" }\' | (sleep 1; cat )'
-                                                            '| %s -qmp stdio -vnc none | grep return |'
+                                                            '| %s -qmp stdio -vnc none -S | grep return |'
                                                             ' grep RAND91' % qemu_binary, timeout=10,
                                                             ignore_status=True, shell=True,
                                                             verbose=False)).splitlines()
@@ -93,32 +113,42 @@ class DevContainer(object):
                 return cmds
 
         self.__state = -1    # -1 synchronized, 0 synchronized after hotplug
-        self.__qemu_help = decode_to_text(process.system_output("%s -help" % qemu_binary,
-                                                                timeout=10, ignore_status=True,
-                                                                shell=True, verbose=False))
+        self.__qemu_binary = qemu_binary
+        self.__execute_qemu_last = None
+        self.__execute_qemu_out = ""
+        # Check whether we need to add machine_type
+        cmd = "%s -device \? 2>&1" % qemu_binary
+        result = process.run(cmd, timeout=10,
+                             ignore_status=True,
+                             shell=True,
+                             verbose=False)
+        # Some architectures (arm) require machine type to be always set
+        if result.exit_status and b"machine specified" in result.stdout:
+            self.__workaround_machine_type = True
+            basic_qemu_cmd = "%s -machine virt" % qemu_binary
+        else:
+            self.__workaround_machine_type = False
+            basic_qemu_cmd = qemu_binary
+        self.__qemu_help = self.execute_qemu("-help", 10)
         # escape the '?' otherwise it will fail if we have a single-char
         # filename in cwd
-        self.__device_help = decode_to_text(process.system_output("%s -device \? 2>&1" %
-                                                                  qemu_binary, timeout=10,
-                                                                  ignore_status=True,
-                                                                  shell=True,
-                                                                  verbose=False))
+        self.__device_help = self.execute_qemu("-device \? 2>&1", 10)
         self.__machine_types = decode_to_text(process.system_output("%s -M \?" % qemu_binary,
                                                                     timeout=10,
                                                                     ignore_status=True,
                                                                     shell=True,
                                                                     verbose=False))
-        self.__hmp_cmds = get_hmp_cmds(qemu_binary)
-        self.__qmp_cmds = get_qmp_cmds(qemu_binary,
+        self.__hmp_cmds = get_hmp_cmds(basic_qemu_cmd)
+        self.__qmp_cmds = get_qmp_cmds(basic_qemu_cmd,
                                        workaround_qemu_qmp_crash == 'always')
         self.vmname = vmname
         self.strict_mode = strict_mode == 'yes'
         self.__devices = []
         self.__buses = []
-        self.__qemu_binary = qemu_binary
-        self.__execute_qemu_last = None
-        self.__execute_qemu_out = ""
         self.allow_hotplugged_vm = allow_hotplugged_vm == 'yes'
+        if capabilities is None:
+            capabilities = Capabilities()
+        self.__caps = capabilities
 
     def __getitem__(self, item):
         """
@@ -322,6 +352,22 @@ class DevContainer(object):
                     ret.append(device)
         return ret
 
+    def get_qdev_by_drive(self, device):
+        """
+        Get the qdev ID of device by drive name.
+
+        :param device: device name
+        :type device: str
+        :return: the qdev ID
+        :rtype: str
+        """
+        for dev in self.__devices:
+            try:
+                if isinstance(dev, qdevices.QDevice) and device == dev.params['drive']:
+                    return dev.params['id']
+            except KeyError:
+                continue
+
     def str_short(self):
         """ Short string representation of all devices """
         out = "Devices of %s" % self.vmname
@@ -366,7 +412,7 @@ class DevContainer(object):
 
     def str_bus_long(self):
         """ Long representation of all buses """
-        out = "Devices of %s:\n  " % self.vmname
+        out = "Buses of %s:\n  " % self.vmname
         for bus in self.__buses:
             out += bus.str_long().replace('\n', '\n  ')
         return out[:-3]
@@ -431,20 +477,17 @@ class DevContainer(object):
         :rtype: string
         """
         if self.__execute_qemu_last != options:
-            cmd = "%s %s 2>&1" % (self.__qemu_binary, options)
+            if self.__workaround_machine_type:
+                cmd = "%s -machine virt %s 2>&1" % (self.__qemu_binary,
+                                                    options)
+            else:
+                cmd = "%s %s 2>&1" % (self.__qemu_binary, options)
             result = process.run(cmd, timeout=timeout,
                                  ignore_status=True,
                                  shell=True,
                                  verbose=False)
-            if result.exit_status and b"machine specified" in result.stdout:
-                # TODO: Arm requires machine to be specified, let's try again
-                # with dummy "virt" machine
-                result = process.run("%s -machine virt %s 2>&1"
-                                     % (self.__qemu_binary, options),
-                                     ignore_status=True, shell=True,
-                                     verbose=False)
             self.__execute_qemu_out = results_stdout_52lts(result)
-        self.__execute_qemu_last = options
+            self.__execute_qemu_last = options
         return self.__execute_qemu_out
 
     def get_buses(self, bus_spec, type_test=False):
@@ -640,7 +683,7 @@ class DevContainer(object):
                                      % exc, self, ver_out)
         return out, ver_out
 
-    def simple_unplug(self, device, monitor):
+    def simple_unplug(self, device, monitor, timeout=30):
         """
         Function unplug device to devices representation. If verification is
         supported by unplugged device and result of verification is True
@@ -651,6 +694,8 @@ class DevContainer(object):
         :type device: string, qdevices.QDevice.
         :param monitor: Monitor from vm.
         :type monitor: qemu_monitor.Monitor
+        :param timeout: execution timeout
+        :type timeout: int
         :return: tuple(monitor.cmd(), verify_unplug output)
         """
         device = self[device]
@@ -663,7 +708,7 @@ class DevContainer(object):
         from virttest import utils_misc
         if not utils_misc.wait_for(
                 lambda: device.verify_unplug(out, monitor) is True,
-                first=1, step=5, timeout=30):
+                first=1, step=5, timeout=timeout):
             self.set_clean()
             return out, device.verify_unplug(out, monitor)
 
@@ -673,7 +718,20 @@ class DevContainer(object):
             device.unplug_hook()
             drive = device.get_param("drive")
             if drive:
-                self.remove(drive)
+                if Flags.BLOCKDEV in self.__caps:
+                    format_node = self[drive]
+                    nodes = [format_node]
+                    nodes.extend((n for n in format_node.get_child_nodes()))
+                    for node in nodes:
+                        if not node.verify_unplug(node.unplug(monitor), monitor):
+                            raise DeviceUnplugError(
+                                node, "Failed to unplug blockdev node.", self)
+                        self.remove(node, True if isinstance(
+                            node, qdevices.QBlockdevFormatNode) else False)
+                        if not isinstance(node, qdevices.QBlockdevFormatNode):
+                            format_node.del_child_node(node)
+                else:
+                    self.remove(drive)
             self.remove(device, True)
             if ver_out is True:
                 self.set_clean()
@@ -910,11 +968,15 @@ class DevContainer(object):
             devices.append(qdevices.QStringDevice('AAVMF_CODE',
                                                   cmdline=aavmf_code))
             aavmf_vars = get_aavmf_vars(params)
-            if not os.path.exists(aavmf_vars):
-                logging.warn("AAVMF variables file '%s' doesn't exist, "
-                             "recreating it from the template (this should "
-                             "only happen when you install the machine as "
-                             "there is no default boot in EFI!)", aavmf_vars)
+            force_create = params.get("force_create_image_image1",
+                                      params.get("force_create_image"))
+            if (force_create == "yes" or not os.path.exists(aavmf_vars)):
+                if force_create != "yes":
+                    logging.warn("AAVMF variables file '%s' doesn't exist, "
+                                 "recreating it from the template (this should"
+                                 " only happen when you install the machine as"
+                                 " there is no default boot in EFI!)",
+                                 aavmf_vars)
                 shutil.copy2('/usr/share/AAVMF/AAVMF_VARS.fd', aavmf_vars)
             aavmf_vars = ("-drive file=%s,if=pflash,format=raw,unit=1"
                           % aavmf_vars)
@@ -959,34 +1021,28 @@ class DevContainer(object):
             devices.append(qdevices.QStringDevice('AAVMF_CODE',
                                                   cmdline=aavmf_code))
             aavmf_vars = get_aavmf_vars(params)
-            if not os.path.exists(aavmf_vars):
-                logging.warn("AAVMF variables file '%s' doesn't exist, "
-                             "recreating it from the template (this should "
-                             "only happen when you install the machine as "
-                             "there is no default boot in EFI!)", aavmf_vars)
+            force_create = params.get("force_create_image_image1",
+                                      params.get("force_create_image"))
+            if (force_create == "yes" or not os.path.exists(aavmf_vars)):
+                if force_create != "yes":
+                    logging.warn("AAVMF variables file '%s' doesn't exist, "
+                                 "recreating it from the template (this should"
+                                 " only happen when you install the machine as"
+                                 " there is no default boot in EFI!)",
+                                 aavmf_vars)
                 shutil.copy2('/usr/share/AAVMF/AAVMF_VARS.fd', aavmf_vars)
             aavmf_vars = ("-drive file=%s,if=pflash,format=raw,unit=1"
                           % aavmf_vars)
             devices.append(qdevices.QStringDevice('AAVMF_VARS',
                                                   cmdline=aavmf_vars))
-            # Add virtio-bus
-            # TODO: Currently this uses QNoAddrCustomBus and does not
-            # set the device's properties. This means that the qemu qtree
-            # and autotest's representations are completelly different and
-            # can't be used.
-            bus = qdevices.QNoAddrCustomBus('bus', [['addr'], [32]],
-                                            'virtio-mmio-bus', 'virtio-bus',
-                                            'virtio-mmio-bus')
-            devices.append(qdevices.QStringDevice('machine', cmdline=cmd,
-                                                  child_bus=bus,
-                                                  aobject="virtio-mmio-bus"))
-            # And this is the pcie bus
-            bus = (qdevices.QPCIBus('pcie.0', 'PCIE', 'pci.0'),
+
+            bus = (qdevices.QPCIEBus('pcie.0', 'PCIE', root_port_type, 'pci.0'),
                    qdevices.QStrictCustomBus(None, [['chassis'], [256]],
                                              '_PCI_CHASSIS', first_port=[1]),
                    qdevices.QStrictCustomBus(None, [['chassis_nr'], [256]],
                                              '_PCI_CHASSIS_NR', first_port=[1]))
-            devices.append(qdevices.QStringDevice('pci.0', child_bus=bus,
+            devices.append(qdevices.QStringDevice('machine', cmdline=cmd,
+                                                  child_bus=bus,
                                                   aobject="pci.0"))
             devices.append(qdevices.QStringDevice('gpex-root',
                                                   {'addr': 0, 'driver': 'gpex-root'},
@@ -1107,6 +1163,12 @@ class DevContainer(object):
                 logging.warn('Unable to find the default machine type, using '
                              'i440FX')
                 devices = machine_i440FX(False)
+
+        if params.get("vm_pci_hole64_fix"):
+            if machine_type.startswith('pc'):
+                devices.append(qdevices.QGlobal("i440FX-pcihost", "x-pci-hole64-fix", "off"))
+            if machine_type.startswith('q35'):
+                devices.append(qdevices.QGlobal("q35-pcihost", "x-pci-hole64-fix", "off"))
 
         # reserve pci.0 addresses
         pci_params = params.object_params('pci.0')
@@ -1413,9 +1475,9 @@ class DevContainer(object):
         # bus: ahci, virtio-scsi-pci, USB
         #
         if not use_device:
-            if fmt and (fmt == "scsi" or (fmt.startswith('scsi') and
-                                          (scsi_hba == 'lsi53c895a' or
-                                           scsi_hba == 'spapr-vscsi'))):
+            if fmt and (fmt == "scsi" or (fmt.startswith('scsi')
+                                          and (scsi_hba == 'lsi53c895a'
+                                               or scsi_hba == 'spapr-vscsi'))):
                 if not (bus is None and unit is None and port is None):
                     logging.warn("Using scsi interface without -device "
                                  "support; ignoring bus/unit/port. (%s)", name)
@@ -1481,29 +1543,73 @@ class DevContainer(object):
             dev_parent = {'type': fmt}
 
         #
-        # Drive
+        # Drive mode:
         # -drive fmt or -drive fmt=none -device ...
+        # Blockdev mode:
+        # -blockdev node-name ... -device ...
         #
-        if self.has_hmp_cmd('__com.redhat_drive_add') and use_device:
-            devices.append(qdevices.QRHDrive(name))
-        elif self.has_hmp_cmd('drive_add') and use_device:
-            devices.append(qdevices.QHPDrive(name))
-        elif self.has_option("device"):
-            devices.append(qdevices.QDrive(name, use_device))
-        else:       # very old qemu without 'addr' support
-            devices.append(qdevices.QOldDrive(name, use_device))
-        devices[-1].set_param('if', 'none')
-        devices[-1].set_param('rerror', rerror)
-        devices[-1].set_param('werror', werror)
-        devices[-1].set_param('serial', serial)
-        devices[-1].set_param('boot', boot, bool)
-        devices[-1].set_param('snapshot', snapshot, bool)
-        devices[-1].set_param('readonly', readonly, bool)
+        if Flags.BLOCKDEV in self.__caps:
+            protocol_cls = qdevices.QBlockdevProtocolFile
+            if not filename:
+                protocol_cls = qdevices.QBlockdevProtocolNullCo
+            elif fmt in ('scsi-generic', 'scsi-block'):
+                protocol_cls = qdevices.QBlockdevProtocolHostDevice
+            elif blkdebug is not None:
+                protocol_cls = qdevices.QBlockdevProtocolBlkdebug
+
+            if imgfmt == 'qcow2':
+                format_cls = qdevices.QBlockdevFormatQcow2
+            elif imgfmt == 'raw' or media == 'cdrom':
+                format_cls = qdevices.QBlockdevFormatRaw
+
+            format_node = format_cls(name)
+            protocol_node = protocol_cls(name)
+            format_node.add_child_node(protocol_node)
+            devices.append(protocol_node)
+            devices.append(format_node)
+        else:
+            if self.has_hmp_cmd('__com.redhat_drive_add') and use_device:
+                devices.append(qdevices.QRHDrive(name))
+            elif self.has_hmp_cmd('drive_add') and use_device:
+                devices.append(qdevices.QHPDrive(name))
+            elif self.has_option("device"):
+                devices.append(qdevices.QDrive(name, use_device))
+            else:       # very old qemu without 'addr' support
+                devices.append(qdevices.QOldDrive(name, use_device))
+
+        if Flags.BLOCKDEV in self.__caps:
+            for opt, val in zip(('snapshot', 'serial', 'boot'),
+                                (snapshot, serial, boot)):
+                if val is not None:
+                    if (opt, val) == ('snapshot', 'yes'):
+                        raise exceptions.TestCancel(
+                            "The snapshot=on is not supported by -blockdev.")
+                    logging.warn("The command line option %s is not supported "
+                                 "on %s by -blockdev." % (opt, name))
+            if media == 'cdrom':
+                readonly = 'on'
+            devices[-2].set_param('read-only', readonly, bool)
+            devices[-1].set_param('read-only', readonly, bool)
+        else:
+            devices[-1].set_param('if', 'none')
+            devices[-1].set_param('rerror', rerror)
+            devices[-1].set_param('werror', werror)
+            devices[-1].set_param('serial', serial)
+            devices[-1].set_param('boot', boot, bool)
+            devices[-1].set_param('snapshot', snapshot, bool)
+            devices[-1].set_param('readonly', readonly, bool)
+
         if 'aio' in self.get_help_text():
             if aio == 'native' and snapshot == 'yes':
                 logging.warn('snapshot is on, fallback aio to threads.')
                 aio = 'threads'
-            devices[-1].set_param('aio', aio)
+                if Flags.BLOCKDEV in self.__caps:
+                    if isinstance(devices[-2], (qdevices.QBlockdevProtocolFile,
+                                                qdevices.QBlockdevProtocolHostDevice,
+                                                qdevices.QBlockdevProtocolHostCdrom)):
+                        devices[-2].set_param('aio', aio)
+                else:
+                    devices[-1].set_param('aio', aio)
             if aio == 'native':
                 # Since qemu 2.6, aio=native has no effect without
                 # cache.direct=on or cache=none, It will be error out.
@@ -1513,18 +1619,33 @@ class DevContainer(object):
         # More info from qemu commit 91a097e74.
         if not filename:
             cache = None
-        devices[-1].set_param('cache', cache)
-        devices[-1].set_param('media', media)
-        devices[-1].set_param('format', imgfmt)
-        if blkdebug is not None:
-            devices[-1].set_param('file', 'blkdebug:%s:%s' % (blkdebug,
-                                                              filename))
+        if Flags.BLOCKDEV in self.__caps:
+            devices[-2].set_param('filename', filename)
+            for dev in (devices[-1], devices[-2]):
+                if not cache:
+                    direct, no_flush = (None, None)
+                else:
+                    direct, no_flush = (self.cache_map[cache]['cache.direct'],
+                                        self.cache_map[cache]['cache.no-flush'])
+                dev.set_param('cache.direct', direct)
+                dev.set_param('cache.no-flush', no_flush)
+            devices[-1].set_param('file', devices[-2].get_qid())
         else:
-            devices[-1].set_param('file', filename)
+            devices[-1].set_param('cache', cache)
+            devices[-1].set_param('media', media)
+            devices[-1].set_param('format', imgfmt)
+            if blkdebug is not None:
+                devices[-1].set_param('file', 'blkdebug:%s:%s' % (blkdebug, filename))
+            else:
+                devices[-1].set_param('file', filename)
         if drv_extra_params:
             drv_extra_params = (_.split('=', 1) for _ in
                                 drv_extra_params.split(',') if _)
             for key, value in drv_extra_params:
+                if Flags.BLOCKDEV in self.__caps:
+                    if key == 'discard':
+                        value = re.sub('on', 'unmap', re.sub('off', 'ignore', value))
+                    devices[-2].set_param(key, value)
                 devices[-1].set_param(key, value)
         if not use_device:
             if fmt and fmt.startswith('scsi-'):
@@ -1611,6 +1732,15 @@ class DevContainer(object):
             devices[-1].set_param('x-data-plane', x_data_plane, bool)
         else:
             devices[-1].set_param('iothread', x_data_plane)
+        if Flags.BLOCKDEV in self.__caps:
+            if isinstance(devices[-3], qdevices.QBlockdevProtocolHostDevice):
+                self.cache_map[cache]['write-cache'] = None
+            write_cache = None if not cache else self.cache_map[cache]['write-cache']
+            devices[-1].set_param('write-cache', write_cache)
+            if 'scsi-generic' == fmt:
+                rerror, werror = (None, None)
+            devices[-1].set_param('rerror', rerror)
+            devices[-1].set_param('werror', werror)
         if 'serial' in options:
             devices[-1].set_param('serial', serial)
             devices[-2].set_param('serial', None)   # remove serial from drive
@@ -1707,6 +1837,135 @@ class DevContainer(object):
                                                image_params.get(
                                                    "bus_extra_params"),
                                                image_params.get("force_drive_format"))
+
+    def serials_define_by_variables(self, serial_id, serial_type, chardev_id,
+                                    bus_type=None, serial_name=None,
+                                    bus=None, nr=None, reg=None):
+        """
+        Creates related devices by variables
+
+        :param serial_id: the id of the serial device
+        :param serial_type: the type of the serial device
+        :param chardev_id: the id of the chardev device
+        :param bus_type: bus type of the serial device(optional, virtio only)
+        :param serial_name: the name option of serial device(optional)
+        :param bus: the busid of parent bus(optional, virtio only)
+        :param nr: the nr(port) of the parent bus(optional, virtio only)
+        :param reg: reg option of isa-serial(optional)
+        :return: the device list that construct the serial device
+        """
+
+        devices = []
+        # For virtio devices, generate controller and create the port device
+        if serial_type.startswith('virt'):
+            if not bus:
+                if bus_type == 'virtio-serial-device':
+                    pci_bus = {'type': 'virtio-bus'}
+                else:
+                    pci_bus = {'aobject': 'pci.0'}
+                bus = self.get_first_free_bus(
+                    {'type': 'SERIAL', 'atype': bus_type}, [None, nr])
+                #  Multiple virtio console devices can't share a single bus
+                if bus is None or serial_type == 'virtconsole':
+                    _hba = bus_type.replace('-', '_') + '%s'
+                    bus = self.idx_of_next_named_bus(_hba)
+                    bus = self.list_missing_named_buses(
+                        _hba, 'SERIAL', bus + 1)[-1]
+                    logging.debug("list missing named bus: %s", bus)
+                    devices.append(
+                        qdevices.QDevice(bus_type,
+                                         {"id": bus},
+                                         bus,
+                                         pci_bus,
+                                         qdevices.QSerialBus(
+                                             bus, bus_type, bus)))
+                else:
+                    bus = bus.busid
+            devices.append(
+                qdevices.QDevice(serial_type,
+                                 {"id": serial_id},
+                                 parent_bus={'busid': bus}))
+            devices[-1].set_param('name', serial_name)
+        else:  # none virtio type, generate serial device directly
+            devices.append(qdevices.QDevice(serial_type, {"id": serial_id}))
+            devices[-1].set_param("reg", reg)
+        devices[-1].set_param('chardev', chardev_id)
+
+        return devices
+
+    def serials_define_by_params(self, serial_id, params,
+                                 file_name=None):
+        """
+        Wrapper for creating serial device from serial params.
+
+        :param serial_id: id of serial object
+        :param params: serial params
+        :param file_name: the file path of the serial device (optional)
+        :return: the device list that construct the serial device
+        """
+        serial_type = params['serial_type']
+        machine = params.get('machine_type')
+
+        # Arm lists "isa-serial" as supported but can't use it,
+        # fallback to "-serial"
+        legacy_cmd = " -serial unix:'%s',server,nowait" % file_name
+        legacy_dev = qdevices.QStringDevice('SER-%s' % serial_id,
+                                            cmdline=legacy_cmd)
+        arm_serial = (serial_type == 'isa-serial'
+                      and 'arm' in params.get("machine_type", ""))
+        if (arm_serial or not self.has_option("chardev")
+                or not self.has_device(serial_type)):
+            return legacy_dev
+
+        bus_type = None
+        if serial_type.startswith('virt'):
+            if '-mmio' in machine:
+                controller_suffix = 'device'
+            elif machine.startswith("s390"):
+                controller_suffix = 'ccw'
+            else:
+                controller_suffix = 'pci'
+            bus_type = 'virtio-serial-%s' % controller_suffix
+        chardev_id = 'chardev_%s' % serial_id
+        chardev_device = self.chardev_define_by_params(chardev_id, params, file_name)
+        serial_devices = self.serials_define_by_variables(
+            serial_id, serial_type, chardev_id, bus_type=bus_type,
+            serial_name=params.get("serial_name"), bus=params.get("serial_bus"),
+            nr=params.get("serial_nr"), reg=params.get("serial_reg"))
+
+        return [chardev_device] + serial_devices
+
+    def chardev_define_by_params(self, chardev_id, params, file_name=None):
+        """
+        Wrapper for creating -chardev device from params.
+        :param chardev_id: chardev id
+        :param params: chardev params
+        :param file_name: file name of chardev (optional)
+        :return: CharDevice object
+        """
+        backend = params.get('chardev_backend', 'unix_socket')
+        # for tcp_socket and unix_socket, both form to 'socket'
+        _backend = 'socket' if 'socket' in backend else backend
+        # Generate -chardev device
+        chardev_param = Params({'backend': _backend, 'id': chardev_id})
+        if backend in ['unix_socket', 'file', 'pipe', 'serial',
+                       'tty', 'parallel', 'parport']:
+            chardev_param.update({'path': file_name})
+        elif backend in ['udp', 'tcp_socket']:
+            chardev_param.update(
+                {'host': params['chardev_host'],
+                 'port': params['chardev_port'],
+                 'ipv4': params.get('chardev_ipv4'),
+                 'ipv6': params.get('chardev_ipv6')})
+        if 'socket' in backend:  # tcp_socket & unix_socket
+            chardev_param.update(
+                {'server': params.get('chardev_server', 'yes'),
+                 'nowait': params.get('chardev_nowait', 'yes')})
+        elif backend in ['spicevmc', 'spiceport']:
+            chardev_param.update(
+                {'debug': params.get('chardev_debug'),
+                 'name': params.get('chardev_name')})
+        return qdevices.CharDevice(chardev_param, chardev_id)
 
     def cdroms_define_by_params(self, name, image_params, media=None,
                                 index=None, image_boot=None,
@@ -1890,6 +2149,7 @@ class DevContainer(object):
         Create memory modules by params, include memory object and
         pc-dimm devices.
         """
+        params = params.object_params(name)
         devices = []
         if not self.has_device("pc-dimm"):
             logging.warn("'PC-DIMM' does not support by your qemu")
@@ -1902,4 +2162,52 @@ class DevContainer(object):
                 dimm = self.dimm_device_define_by_params(params, name)
                 dimm.set_param("memdev", mem.get_qid())
                 devices.append(dimm)
+        return devices
+
+    def input_define_by_params(self, params, name, bus=None):
+        """
+        Create input device by params.
+
+        :param params: VM params.
+        :param name: Object name of input device.
+        :param bus: Parent bus.
+        """
+        params = params.object_params(name)
+        dev_map = {"mouse": {"virtio": "virtio-mouse"},
+                   "keyboard": {"virtio": "virtio-keyboard"},
+                   "tablet": {"virtio": "virtio-tablet"}}
+        dev_type = params["input_dev_type"]
+        bus_type = params["input_dev_bus_type"]
+        driver = dev_map.get(dev_type)
+        if not driver:
+            raise ValueError("unsupported input device type")
+        driver = driver.get(bus_type)
+        if not driver:
+            raise ValueError("unsupported input device bus")
+
+        machine_type = params.get("machine_type", "")
+        qbus_type = "PCI"
+        if machine_type.startswith("q35") or machine_type.startswith("arm64"):
+            qbus_type = "PCIE"
+
+        if bus_type == "virtio":
+            if "-mmio:" in machine_type:
+                driver += "-device"
+                qbus_type = "virtio-bus"
+            elif machine_type.startswith("s390"):
+                driver += "-ccw"
+                qbus_type = "virtio-bus"
+            else:
+                driver += "-pci"
+
+        if bus is None:
+            bus = {"type": qbus_type}
+        devices = []
+        if self.has_device(driver):
+            dev = qdevices.QDevice(driver, parent_bus=bus)
+            dev.set_param("id", "input_%s" % name)
+            devices.append(dev)
+        else:
+            logging.warn("'%s' is not supported by your qemu", driver)
+
         return devices

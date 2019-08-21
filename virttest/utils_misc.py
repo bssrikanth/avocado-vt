@@ -27,6 +27,7 @@ import platform
 import traceback
 import math
 import select
+import aexpect
 
 try:
     from io import BytesIO
@@ -54,7 +55,17 @@ from avocado.utils import download
 from avocado.utils import linux_modules
 from avocado.utils import memory
 from avocado.utils.astring import string_safe_encode
+# Symlink avocado implementation of process functions
 from avocado.utils.process import CmdResult
+from avocado.utils.process import pid_exists  # pylint: disable=W0611
+from avocado.utils.process import safe_kill   # pylint: disable=W0611
+from avocado.utils.process import kill_process_tree as _kill_process_tree
+from avocado.utils.process import kill_process_by_pattern  # pylint: disable=W0611
+from avocado.utils.process import process_in_ptree_is_defunct as process_or_children_is_defunct  # pylint: disable=W0611
+# Symlink avocado implementation of port-related functions
+from avocado.utils.network import is_port_free     # pylint: disable=W0611
+from avocado.utils.network import find_free_port   # pylint: disable=W0611
+from avocado.utils.network import find_free_ports  # pylint: disable=W0611
 
 from virttest import data_dir
 from virttest import error_context
@@ -62,6 +73,7 @@ from virttest import cartesian_config
 from virttest import utils_selinux
 from virttest import utils_disk
 from virttest import logging_manager
+from virttest import libvirt_version
 from virttest.staging import utils_koji
 from virttest.staging import service
 from virttest.xml_utils import XMLTreeFile
@@ -179,7 +191,7 @@ def write_keyval(path, dictionary, type_tag=None, tap_report=None):
     :param dictionary: the items to write
     :param type_tag: see text above
     """
-    if os.path.isdir(path):
+    if check_isdir(path):
         path = os.path.join(path, 'keyval')
     keyval = open(path, 'a')
 
@@ -329,60 +341,33 @@ def find_command(cmd):
     return utils_path.find_command(cmd)
 
 
-def pid_exists(pid):
-    """
-    Return True if a given PID exists.
-
-    :param pid: Process ID number.
-    """
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
-
-
-def safe_kill(pid, signal):
-    """
-    Attempt to send a signal to a given process that may or may not exist.
-
-    :param signal: Signal number.
-    """
-    try:
-        os.kill(pid, signal)
-        return True
-    except Exception:
-        return False
-
-
-def kill_process_tree(pid, sig=signal.SIGKILL):
+def kill_process_tree(pid, sig=signal.SIGKILL, send_sigcont=True, timeout=0):
     """Signal a process and all of its children.
 
     If the process does not exist -- return.
 
     :param pid: The pid of the process to signal.
     :param sig: The signal to send to the processes.
+    :param send_sigcont: Send SIGCONT to allow destroying stopped processes
+    :param timeout: How long to wait for the pid(s) to die
+                    (negative=infinity, 0=don't wait,
+                    positive=number_of_seconds)
     """
-    if not safe_kill(pid, signal.SIGSTOP):
-        return
-    children = decode_to_text(process.system_output("ps --ppid=%d -o pid=" % pid,
-                                                    shell=True, ignore_status=True)).split()
-    for child in children:
-        kill_process_tree(int(child), sig)
-    safe_kill(pid, sig)
-    safe_kill(pid, signal.SIGCONT)
-
-
-def kill_process_by_pattern(pattern):
-    """Send SIGTERM signal to a process with matched pattern.
-    :param pattern: normally only matched against the process name
-    """
-    cmd = "pkill -f %s" % pattern
-    result = process.run(cmd, ignore_status=True)
-    if result.exit_status:
-        logging.error("Failed to run '%s': %s", cmd, result)
-    else:
-        logging.info("Succeed to run '%s'.", cmd)
+    try:
+        return _kill_process_tree(pid, sig, send_sigcont, timeout)
+    except TypeError:
+        logging.warning("Trying to kill_process_tree with timeout but running"
+                        " old Avocado without it's support. Sleeping for 10s "
+                        "instead.")
+        # Depending on the Avocado version this can either return None or
+        # list of killed pids.
+        ret = _kill_process_tree(pid, sig, send_sigcont)    # pylint: disable=E1128
+        if timeout != 0:
+            # Use fixed 10s wait when no support for timeout in Avocado
+            time.sleep(10)
+            if pid_exists(pid):
+                raise RuntimeError("Failed to kill_process_tree(%s)" % pid)
+        return ret
 
 
 def get_open_fds(pid):
@@ -391,86 +376,6 @@ def get_open_fds(pid):
 
 def get_virt_test_open_fds():
     return get_open_fds(os.getpid())
-
-
-def process_or_children_is_defunct(ppid):
-    """Verify if any processes from PPID is defunct.
-
-    Attempt to verify if parent process and any children from PPID is defunct
-    (zombie) or not.
-    :param ppid: The parent PID of the process to verify.
-    """
-    defunct = False
-    try:
-        pids = process.get_children_pids(ppid)
-    except process.CmdError:  # Process doesn't exist
-        return True
-    for pid in pids:
-        if pid:
-            cmd = "ps --no-headers -o cmd %d" % int(pid)
-            proc_name = decode_to_text(process.system_output(cmd, ignore_status=True,
-                                                             verbose=False))
-            if '<defunct>' in proc_name:
-                defunct = True
-                break
-    return defunct
-
-# The following are utility functions related to ports.
-
-
-def is_port_free(port, address):
-    """
-    Return True if the given port is available for use.
-
-    :param port: Port number
-    """
-    try:
-        s = socket.socket()
-        # s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if address == "localhost":
-            s.bind(("localhost", port))
-            free = True
-        else:
-            s.connect((address, port))
-            free = False
-    except socket.error:
-        if address == "localhost":
-            free = False
-        else:
-            free = True
-    s.close()
-    return free
-
-
-def find_free_port(start_port, end_port, address="localhost"):
-    """
-    Return a host free port in the range [start_port, end_port].
-
-    :param start_port: First port that will be checked.
-    :param end_port: Port immediately after the last one that will be checked.
-    """
-    for i in range(start_port, end_port):
-        if is_port_free(i, address):
-            return i
-    return None
-
-
-def find_free_ports(start_port, end_port, count, address="localhost"):
-    """
-    Return count of host free ports in the range [start_port, end_port].
-
-    :param count: Initial number of ports known to be free in the range.
-    :param start_port: First port that will be checked.
-    :param end_port: Port immediately after the last one that will be checked.
-    """
-    ports = []
-    i = start_port
-    while i < end_port and count > 0:
-        if is_port_free(i, address):
-            ports.append(i)
-            count -= 1
-        i += 1
-    return ports
 
 
 # An easy way to log lines to files when the logging system can't be used
@@ -1043,7 +948,32 @@ def parallel(targets):
     return [t.join() for t in threads]
 
 
-def safe_rmdir(path, timeout=10):
+def check_isdir(path, session=None):
+    """
+    wrapper method to check given path is dir in local/remote host/VM
+
+    :param path: path to be checked
+    :param session: ShellSession object of VM/remote host
+    """
+    if session:
+        output = session.cmd_output("file %s" % path)
+        return "directory" in output.strip()
+    return os.path.isdir(path)
+
+
+def check_exists(path, session=None):
+    """
+    wrapper method to check given path is exists in local/remote host/VM
+
+    :param path: path to be check whether it exists
+    :param session: ShellSession object of VM/remote host
+    """
+    if session:
+        return session.cmd_status("ls -l %s" % path) == 0
+    return os.path.exists(path)
+
+
+def safe_rmdir(path, timeout=10, session=None):
     """
     Try to remove a directory safely, even on NFS filesystems.
 
@@ -1056,13 +986,18 @@ def safe_rmdir(path, timeout=10):
     :type path: string
     :param timeout: Time that the function will try to remove the dir before
                     giving up (seconds)
+    :param session: ShellSession Object
     :type timeout: int
     :raises: OSError, with errno 39 in case after the timeout
              shutil.rmtree could not successfuly complete. If any attempt
              to rmtree fails with errno different than 39, that exception
              will be just raised.
     """
-    assert os.path.isdir(path), "Invalid directory to remove %s" % path
+    assert check_isdir(path, session=session), "Invalid directory to remove %s" % path
+    func = shutil.rmtree
+    if session:
+        func = session.cmd
+        path = "rm -rf %s" % path
     step = int(timeout / 10)
     start_time = time.time()
     success = False
@@ -1070,7 +1005,7 @@ def safe_rmdir(path, timeout=10):
     while int(time.time() - start_time) < timeout:
         attempts += 1
         try:
-            shutil.rmtree(path)
+            func(path)
             success = True
             break
         except OSError as err_info:
@@ -1080,6 +1015,10 @@ def safe_rmdir(path, timeout=10):
             if err_info.errno != 39:
                 raise
             time.sleep(step)
+        except (aexpect.ShellTimeoutError, aexpect.ShellError) as info:
+            raise exceptions.TestSetupError("Failed to remove directory "
+                                            "%s from remote machine: %s "
+                                            % (path, info))
 
     if not success:
         raise OSError(39,
@@ -1116,7 +1055,7 @@ def mount(src, mount_point, fstype, perm=None, verbose=False, fstype_mtab=None):
 
 
 def is_mounted(src, mount_point, fstype, perm=None, verbose=False,
-               fstype_mtab=None):
+               fstype_mtab=None, session=None):
     """
     Check mount status from /etc/mtab
 
@@ -1132,10 +1071,11 @@ def is_mounted(src, mount_point, fstype, perm=None, verbose=False,
     :type verbose: Boolean
     :param fstype_mtab: file system type in mtab could be different
     :type fstype_mtab: str
+    :param session: Session Object
     :return: if the src is mounted as expect
     :rtype: Boolean
     """
-    return utils_disk.is_mount(src, mount_point, fstype, perm, verbose)
+    return utils_disk.is_mount(src, mount_point, fstype, perm, verbose, session)
 
 
 def install_host_kernel(job, params):
@@ -1358,7 +1298,7 @@ def get_module_params(sys_path, module_name):
     """
     dir_params = os.path.join(sys_path, "module", module_name, "parameters")
     module_params = {}
-    if os.path.isdir(dir_params):
+    if check_isdir(dir_params):
         for filename in os.listdir(dir_params):
             full_dir = os.path.join(dir_params, filename)
             tmp = open(full_dir, 'r').read().strip()
@@ -1369,7 +1309,7 @@ def get_module_params(sys_path, module_name):
 
 
 def create_x509_dir(path, cacert_subj, server_subj, passphrase,
-                    secure=False, bits=1024, days=1095):
+                    secure=False, bits=3072, days=1095):
     """
     Creates directory with freshly generated:
     ca-cart.pem, ca-key.pem, server-cert.pem, server-key.pem,
@@ -1590,6 +1530,18 @@ def add_identities_into_ssh_agent():
     process.run("ssh-add")
 
 
+def make_dirs(dir_name, session=None):
+    """
+    wrapper method to create directory in local/remote host/VM
+
+    :param dir_name: Directory name to be created
+    :param session: ShellSession object of VM/remote host
+    """
+    if session:
+        return session.cmd_status("mkdir -p %s" % dir_name) == 0
+    return os.makedirs(dir_name)
+
+
 class NumaInfo(object):
 
     """
@@ -1604,6 +1556,7 @@ class NumaInfo(object):
         :param all_nodes_path: Alternative path to
                 /sys/devices/system/node/online. Useful for unittesting.
         """
+        from virttest import utils_package
         self.numa_sys_path = "/sys/devices/system/node"
         self.all_nodes = self.get_all_nodes(all_nodes_path)
         self.online_nodes = self.get_online_nodes(online_nodes_path)
@@ -1613,6 +1566,11 @@ class NumaInfo(object):
                                             set(self.online_nodes_withmem))
         self.nodes = {}
         self.distances = {}
+
+        # ensure numactl package is available
+        if not utils_package.package_install('numactl'):
+            logging.error("Numactl package is not installed")
+
         for node_id in self.online_nodes:
             self.nodes[node_id] = NumaNode(node_id + 1)
             self.distances[node_id] = self.get_node_distance(node_id)
@@ -2172,7 +2130,8 @@ def get_host_cpu_models():
 
     cpu_types = {"AuthenticAMD": ["EPYC", "Opteron_G5", "Opteron_G4",
                                   "Opteron_G3", "Opteron_G2", "Opteron_G1"],
-                 "GenuineIntel": ["KnightsMill",
+                 "GenuineIntel": ["KnightsMill", "Icelake-Server",
+                                  "Icelake-Client", "Cascadelake-Server",
                                   "Skylake-Server", "Skylake-Client",
                                   "Broadwell", "Broadwell-noTSX",
                                   "Haswell", "Haswell-noTSX", "IvyBridge",
@@ -2186,6 +2145,12 @@ def get_host_cpu_models():
                    "Opteron_G2": "cx16",
                    "Opteron_G1": "",
                    "KnightsMill": "avx512_4vnniw,avx512pf,avx512er",
+                   "Icelake-Server": "avx512_vnni,la57,clflushopt",
+                   "Icelake-Client": ("avx512_vpopcntdq|avx512-vpopcntdq,"
+                                      "avx512vbmi,avx512vbmi2|avx512_vbmi2,"
+                                      "gfni,vaes,vpclmulqdq,avx512_vnni"),
+                   "Cascadelake-Server": ("avx512f,avx512dq,avx512bw,avx512cd,"
+                                          "avx512vl,clflushopt,avx512_vnni"),
                    "Skylake-Server": "mpx,avx512f,clwb,xgetbv1,pcid",
                    "Skylake-Client": "mpx,xgetbv1,pcid",
                    "Broadwell": "adx,rdseed,3dnowprefetch,hle",
@@ -2283,16 +2248,23 @@ def get_qemu_binary(params):
     if not os.path.isfile(qemu_binary_path):
         logging.debug('Could not find params qemu in %s, searching the '
                       'host PATH for one to use', qemu_binary_path)
-        try:
-            qemu_binary = utils_path.find_command('qemu-kvm')
-            logging.debug('Found %s', qemu_binary)
-        except utils_path.CmdNotFoundError:
-            qemu_binary = utils_path.find_command('kvm')
-            logging.debug('Found %s', qemu_binary)
+        QEMU_BIN_NAMES = ['qemu-kvm', 'qemu-system-%s' % (ARCH),
+                          'qemu-system-ppc64', 'qemu-system-x86',
+                          'qemu_system', 'kvm']
+        for qemu_bin in QEMU_BIN_NAMES:
+            try:
+                qemu_binary = utils_path.find_command(qemu_bin)
+                logging.debug('Found %s', qemu_binary)
+                break
+            except utils_path.CmdNotFoundError:
+                continue
+        else:
+            raise exceptions.TestError("qemu binary names %s not found in "
+                                       "system" % ' '.join(QEMU_BIN_NAMES))
     else:
         library_path = os.path.join(
             _get_backend_dir(params), 'install_root', 'lib')
-        if os.path.isdir(library_path):
+        if check_isdir(library_path):
             library_path = os.path.abspath(library_path)
             qemu_binary = ("LD_LIBRARY_PATH=%s %s" %
                            (library_path, qemu_binary_path))
@@ -2315,7 +2287,7 @@ def get_qemu_dst_binary(params):
     # Update LD_LIBRARY_PATH for built libraries (libspice-server)
     library_path = os.path.join(
         _get_backend_dir(params), 'install_root', 'lib')
-    if os.path.isdir(library_path):
+    if check_isdir(library_path):
         library_path = os.path.abspath(library_path)
         qemu_dst_binary = ("LD_LIBRARY_PATH=%s %s" %
                            (library_path, qemu_binary_path))
@@ -2382,7 +2354,7 @@ def get_qemu_best_cpu_model(params):
     return params.get("default_cpu_model", None)
 
 
-def get_qemu_version(params):
+def get_qemu_version(params=None):
     """
     Get the qemu-kvm(-rhev) version info.
 
@@ -2393,6 +2365,8 @@ def get_qemu_version(params):
     version = {'major': None, 'minor': None, 'update': None, 'is_rhev': False}
     regex = r'\s*[Ee]mulator [Vv]ersion\s*(\d+)\.(\d+)\.(\d+)'
 
+    if params is None:
+        params = {}
     qemu_binary = get_qemu_binary(params)
     version_raw = decode_to_text(process.system_output("%s -version" % qemu_binary,
                                                        shell=True)).splitlines()
@@ -2440,12 +2414,27 @@ def compare_qemu_version(major, minor, update, is_rhev=True, params={}):
     return True
 
 
-def check_if_vm_vcpu_match(vcpu_desire, vm):
+def check_if_vm_vcpu_match(vcpu_desire, vm, connect_uri=None, session=None):
     """
     This checks whether the VM vCPU quantity matches
     the value desired.
+
+    :param vcpu_desire: vcpu value to be checked
+    :param vm: VM Object
+    :param connect_uri: libvirt uri of target host
+    :param session: ShellSession object of VM
+
+    :return: Boolean, True if actual vcpu value matches with vcpu_desire
     """
-    vcpu_actual = vm.get_cpu_count()
+    release = vm.get_distro(connect_uri=connect_uri)
+    if release and release in ['fedora', ]:
+        vcpu_actual = vm.get_cpu_count("cpu_chk_all_cmd",
+                                       connect_uri=connect_uri)
+    else:
+        vcpu_actual = vm.get_cpu_count("cpu_chk_cmd",
+                                       connect_uri=connect_uri)
+    if isinstance(vcpu_desire, str) and vcpu_desire.isdigit():
+        vcpu_desire = int(vcpu_desire)
     if vcpu_desire != vcpu_actual:
         logging.debug("CPU quantity mismatched !!! guest said it got %s "
                       "but we assigned %s" % (vcpu_actual, vcpu_desire))
@@ -2812,7 +2801,8 @@ def get_winutils_vol(session, label="WIN_UTILS"):
 
     :return: volume ID.
     """
-    return get_win_disk_vol(session, condition="VolumeName='%s'" % label)
+    return wait_for(lambda: get_win_disk_vol(session,
+                    condition="VolumeName='%s'" % label), 240)
 
 
 def set_winutils_letter(session, cmd, label="WIN_UTILS"):
@@ -2892,8 +2882,8 @@ def get_all_disks_did(session, partition=False):
     return all_disks_did
 
 
-def format_windows_disk(session, did, mountpoint=None, size=None,
-                        fstype="ntfs", force=False):
+def format_windows_disk(session, did, mountpoint=None, size=None, fstype="ntfs",
+                        labletype=utils_disk.PARTITION_TABLE_TYPE_MBR, force=False):
     """
     Create a partition on disk in windows guest and format it.
 
@@ -2902,11 +2892,14 @@ def format_windows_disk(session, did, mountpoint=None, size=None,
     :param mountpoint: mount point for the disk.
     :param size: partition size.
     :param fstype: filesystem type for the disk.
+    :param labletype: disk partition table type.
+    :param force: if need force format.
     :return Boolean: disk usable or not.
     """
     list_disk_cmd = "echo list disk > disk && "
     list_disk_cmd += "echo exit >> disk && diskpart /s disk"
     disks = session.cmd_output(list_disk_cmd, timeout=120)
+    utils_disk.create_partition_table_windows(session, did, labletype)
 
     if size:
         size = int(float(normalize_data_size(size, order_magnitude="M")))
@@ -2945,12 +2938,14 @@ def format_windows_disk(session, did, mountpoint=None, size=None,
                 mkpart_cmd = 'echo create partition primary size=%s '
                 mkpart_cmd += '>> disk'
                 mkpart_cmd = mkpart_cmd % size
-            mkpart_cmd = ' '.join([cmd_header, mkpart_cmd, cmd_footer])
+            list_cmd = ' && echo list partition >> disk '
+            cmds = ' '.join([cmd_header, mkpart_cmd, list_cmd, cmd_footer])
             logging.info("Create partition on 'Disk%s'" % did)
-            session.cmd(mkpart_cmd)
+            partition_index = re.search(
+                r'\*\s+Partition\s(\d+)\s+', session.cmd(cmds), re.M).group(1)
             logging.info("Format the 'Disk%s' to %s" % (did, fstype))
             format_cmd = 'echo list partition >> disk && '
-            format_cmd += 'echo select partition 1 >> disk && '
+            format_cmd += 'echo select partition %s >> disk && ' % partition_index
             if not mountpoint:
                 format_cmd += 'echo assign >> disk && '
             else:
@@ -3242,7 +3237,7 @@ def is_qemu_capability_supported(capability):
     :raise: exceptions.TestError: if no capability file or no directory
     """
     qemu_path = "/var/cache/libvirt/qemu/capabilities/"
-    if not os.path.isdir(qemu_path) or not len(os.listdir(qemu_path)):
+    if not check_isdir(qemu_path) or not len(os.listdir(qemu_path)):
         raise exceptions.TestError("Missing the directory %s or no file "
                                    "exists in the directory" % qemu_path)
     qemu_capxml = qemu_path + os.listdir(qemu_path)[0]
@@ -3342,7 +3337,7 @@ class KSMController(object):
         # Default control way is files on host
         # But it will be ksmctl command on older ksm version
         self.interface = "sysfs"
-        if os.path.isdir(self.ksm_path):
+        if check_isdir(self.ksm_path):
             _KSM_PARAMS = os.listdir(_KSM_PATH)
             for param in _KSM_PARAMS:
                 self.ksm_params[param] = _KSM_PATH + param
@@ -3561,6 +3556,10 @@ def verify_dmesg(dmesg_log_file=None, ignore_result=False, level_check=3,
                         4 - emerg,alert,crit,err
                         5 - emerg,alert,crit,err,warn
     :param session: session object to guest
+    :param return: if ignore_result=True, return True if no errors/crash
+                   observed, False otherwise.
+    :param raise: if ignore_result=False, raise TestFail exception on
+                  observing errors/crash
     """
     cmd = "dmesg -T -l %s|grep ." % ",".join(map(str, xrange(0, int(level_check))))
     if session:
@@ -3588,6 +3587,8 @@ def verify_dmesg(dmesg_log_file=None, ignore_result=False, level_check=3,
             process.system("dmesg -C", ignore_status=True)
         if not ignore_result:
             raise exceptions.TestFail(err)
+        return False
+    return True
 
 
 def add_ker_cmd(kernel_cmdline, kernel_param, remove_similar=False):
@@ -3773,7 +3774,7 @@ def check_device_driver(pci_id, driver_type):
     Check whether device's driver is same as expected.
     """
     device_driver = "/sys/bus/pci/devices/%s/driver" % pci_id
-    if not os.path.isdir(device_driver):
+    if not check_isdir(device_driver):
         logging.debug("Make sure %s has binded driver.")
         return False
     driver = decode_to_text(process.system_output("readlink %s" % device_driver,
@@ -3944,6 +3945,7 @@ class SELinuxBoolean(object):
         self.server_ip = params.get("server_ip", None)
         self.ssh_user = params.get("server_user", "root")
         self.ssh_cmd = "ssh %s@%s " % (self.ssh_user, self.server_ip)
+        self.ssh_obj = None
         if self.server_ip:
             # Setup SSH connection
             from virttest.utils_conn import SSHConnection
@@ -4012,11 +4014,10 @@ class SELinuxBoolean(object):
         else:
             self.cleanup_remote = False
 
-    def cleanup(self, keep_authorized_keys=False):
+    def cleanup(self, keep_authorized_keys=False, auto_recover=False):
         """
         Cleanup SELinux boolean value.
         """
-        self.ssh_obj.auto_recover = True
 
         # Recover local SELinux boolean value
         if self.cleanup_local and not self.selinux_disabled:
@@ -4034,8 +4035,10 @@ class SELinuxBoolean(object):
                 raise exceptions.TestError(results_stderr_52lts(result).strip())
 
         # Recover SSH connection
-        if self.ssh_obj.auto_recover and not keep_authorized_keys:
-            del self.ssh_obj
+        if self.ssh_obj:
+            self.ssh_obj.auto_recover = auto_recover
+            if self.ssh_obj.auto_recover and not keep_authorized_keys:
+                del self.ssh_obj
 
     def setup_local(self):
         """
@@ -4084,7 +4087,8 @@ class SELinuxBoolean(object):
 
 def get_model_features(model_name):
     """
-    /usr/share/libvirt/cpu_map.xml defines all CPU models.
+    libvirt-4.5.0 :/usr/share/libvirt/cpu_map.xml defines all CPU models.
+    libvirt-5.0.0 :/usr/share/libvirt/cpu_map/ defines all CPU models.
     One CPU model is a set of features.
     This function is to get features of one specific model.
 
@@ -4094,26 +4098,37 @@ def get_model_features(model_name):
     """
     features = []
     conf = "/usr/share/libvirt/cpu_map.xml"
+    conf_dir = "/usr/share/libvirt/cpu_map/"
 
     try:
-        output = open(conf, 'r').read()
-        root = ET.fromstring(output)
-        # Find model
-        for model_n in root.findall('arch/model'):
-            if model_n.get('name') == model_name:
-                model_node = model_n
-                for feature in model_n.findall('feature'):
-                    features.append(feature.get('name'))
-                break
-        # Handle nested model
-        nested_model = model_node.find('model')
-        if nested_model is not None:
-            nested_model_name = nested_model.get('name')
-            for model_n in root.findall('arch/model'):
-                if model_n.get('name') == nested_model_name:
-                    for feature in model_n.findall('feature'):
-                        features.append(feature.get('name'))
-                    break
+        if not libvirt_version.version_compare(5, 0, 0):
+            with open(conf, 'r') as output:
+                root = ET.fromstring(output.read())
+                while True:
+                    # Find model in file /usr/share/libvirt/cpu_map.xml
+                    for model_n in root.findall('arch/model'):
+                        if model_n.get('name') == model_name:
+                            model_node = model_n
+                            for feature in model_n.findall('feature'):
+                                features.append(feature.get('name'))
+                            break
+                    # Handle nested model
+                    if model_node.find('model') is not None:
+                        model_name = model_node.find('model').get('name')
+                        continue
+                    else:
+                        break
+
+        else:
+            # Find model in dir /usr/share/libvirt/cpu_map
+            filelist = os.listdir(conf_dir)
+            for file_name in filelist:
+                if model_name in file_name:
+                    with open(os.path.join(conf_dir, file_name), "r") as output:
+                        model = ET.fromstring(output.read())
+                        for feature in model.findall("model/feature"):
+                            features.append(feature.get('name'))
+                        break
     except ET.ParseError as error:
         logging.warn("Configuration file %s has wrong xml format" % conf)
         raise
@@ -4573,11 +4588,11 @@ def get_pid(name, session=None):
     """
     Get pid by process name
 
-    :param name: Name of the process to retrieve its pid
+    :param name: Name of the process/string in process cmdline to retrieve its pid
     :param session: ShellSession object of VM or remote host
     :return: Pid of the process or None in case of exceptions
     """
-    cmd = "ps -ef | grep '%s' | grep -v grep" % name
+    cmd = "pgrep -f '%s'" % name
     if session:
         status, output = session.cmd_status_output(cmd)
     else:
@@ -4586,7 +4601,7 @@ def get_pid(name, session=None):
     if status:
         return None
     else:
-        return int(output.split()[1])
+        return int(output.split()[0])
 
 
 def start_rsyslogd():
@@ -4672,7 +4687,7 @@ def get_sosreport(path=None, session=None, remote_ip=None, remote_pwd=None,
         path = "/tmp/sosreport"
         session.cmd("mkdir -p %s" % path)
     else:
-        if os.path.isdir(path):
+        if check_isdir(path):
             os.remove(path)
         os.makedirs(path)
     cmd += " --tmp-dir %s" % path

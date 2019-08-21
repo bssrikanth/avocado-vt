@@ -958,7 +958,7 @@ def reboot(name, options="", **dargs):
     Run a reboot command in the target domain.
 
     :param name: Name of domain.
-    :param options: options: options to pass to reboot command
+    :param options: options to pass to reboot command
     :return: CmdResult object
     """
     return command("reboot --domain %s %s" % (name, options), **dargs)
@@ -969,7 +969,7 @@ def managedsave(name, options="", **dargs):
     Managed save of a domain state.
 
     :param name: Name of domain to save
-    :param options: options: options to pass to list command
+    :param options: options to pass to list command
     :return: CmdResult object
     """
     return command("managedsave --domain %s %s" % (name, options), **dargs)
@@ -983,6 +983,40 @@ def managedsave_remove(name, **dargs):
     :return: CmdResult object
     """
     return command("managedsave-remove --domain %s" % name, **dargs)
+
+
+def managedsave_dumpxml(name, options="", **dargs):
+    """
+    Dump XML of domain information for a managed save state file.
+
+    :param name: Name of domain to dump
+    :param options: options to pass to list command
+    :return: CmdResult object
+    """
+    return command("managedsave-dumpxml --domain %s %s" % (name, options), **dargs)
+
+
+def managedsave_edit(name, options="", **dargs):
+    """
+    Edit the domain XML associated with the managed save state file.
+
+    :param name: Name of domain to edit
+    :param options: options to pass to list command
+    :return: CmdResult object
+    """
+    return command("managedsave-edit --domain %s %s" % (name, options), **dargs)
+
+
+def managedsave_define(name, xml_path, options="", **dargs):
+    """
+    Replace the domain XML associated with a managed save state file.
+
+    :param name: Name of domain to define
+    :param xml_path: Path of xml file to be defined
+    :param options: options to pass to list command
+    :return: CmdResult object
+    """
+    return command("managedsave-define --domain %s %s %s" % (name, xml_path, options), **dargs)
 
 
 def driver(**dargs):
@@ -1369,15 +1403,18 @@ def destroy(name, options="", **dargs):
     return command("destroy %s %s" % (name, options), **dargs)
 
 
-def define(xml_path, **dargs):
+def define(xml_path, options=None, **dargs):
     """
     Return cmd result of domain define.
 
     :param xml_path: XML file path
+    :param options: options for virsh define
     :param dargs: standardized virsh function API keywords
     :return: CmdResult object
     """
     cmd = "define --file %s" % xml_path
+    if options is not None:
+        cmd += " %s" % options
     logging.debug("Define VM from %s", xml_path)
     return command(cmd, **dargs)
 
@@ -1489,22 +1526,25 @@ def migrate_setspeed(domain, bandwidth, extra=None, **dargs):
     return command(cmd, **dargs)
 
 
-def migrate_getspeed(domain, **dargs):
+def migrate_getspeed(domain, extra="", **dargs):
     """
     Get the maximum migration bandwidth (in MiB/s) for
     a domain.
 
     :param domain: name/uuid/id of guest
+    :param extra: extra options to migrate-getspeed
     :param dargs: standardized virsh function API keywords
     :return: standard output from command
     """
     cmd = "migrate-getspeed %s" % domain
+    if extra:
+        cmd += " %s" % extra
     return command(cmd, **dargs)
 
 
 def migrate_setmaxdowntime(domain, downtime, extra=None, **dargs):
     """
-    Set maximum tolerable downtime of a domain
+    Set maximum tolerable downtime of a domain (in ms)
     which is being live-migrated to another host.
 
     :param domain: name/uuid/id of guest
@@ -1513,6 +1553,18 @@ def migrate_setmaxdowntime(domain, downtime, extra=None, **dargs):
     cmd = "migrate-setmaxdowntime %s %s" % (domain, downtime)
     if extra is not None:
         cmd += " %s" % extra
+    return command(cmd, **dargs)
+
+
+def migrate_getmaxdowntime(domain, **dargs):
+    """
+    Get maximum tolerable downtime of a domain.
+
+    :param domain: name/uuid/id of guest
+    :param dargs: standardized virsh function API keywords
+    :return: standard output from command
+    """
+    cmd = "migrate-getmaxdowntime %s" % domain
     return command(cmd, **dargs)
 
 
@@ -3113,6 +3165,18 @@ def cpu_compare(xml_file, **dargs):
     :return: CmdResult instance
     """
     return command("cpu-compare %s" % xml_file, **dargs)
+
+
+def hypervisor_cpu_compare(xml_file, options="", **dargs):
+    """
+    Compare CPU provided by hypervisor on the host with a CPU described by an XML file
+
+    :param xml_file: file containing an XML CPU description
+    :param options: extra options passed to virsh command
+    :param dargs: standardized virsh function API keywords
+    :return: CmdResult instance
+    """
+    return command("hypervisor-cpu-compare %s %s" % (xml_file, options), **dargs)
 
 
 def cpu_baseline(xml_file, **dargs):

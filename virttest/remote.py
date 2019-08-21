@@ -156,7 +156,8 @@ def handle_prompts(session, username, password, prompt, timeout=10,
                  r"[Cc]onnection.*closed", r"[Cc]onnection.*refused",
                  r"[Pp]lease wait", r"[Ww]arning", r"[Ee]nter.*username",
                  r"[Ee]nter.*password", r"[Cc]onnection timed out", prompt,
-                 r"Escape character is.*"],
+                 r"Escape character is.*",
+                 r"Command>"],
                 timeout=timeout, internal_timeout=0.5)
             output += text
             if match == 0:  # "Are you sure you want to continue connecting"
@@ -211,6 +212,15 @@ def handle_prompts(session, username, password, prompt, timeout=10,
             elif match == 13:  # console prompt
                 logging.debug("Got console prompt, send return to show login")
                 session.sendline()
+            elif match == 14:  # VMware vCenter command prompt
+                # Some old vsphere version (e.x. 6.0.0) needs to enable first.
+                cmd = 'shell.set --enabled True'
+                logging.debug(
+                    "Got VMware VCenter prompt, send '%s' to enable shell first" % cmd)
+                session.sendline(cmd)
+                logging.debug(
+                    "Got VMware VCenter prompt, send 'shell' to launch bash")
+                session.sendline('shell')
         except aexpect.ExpectTimeoutError as e:
             # sometimes, linux kernel print some message to console
             # the message maybe impact match login pattern, so send
@@ -229,8 +239,9 @@ def handle_prompts(session, username, password, prompt, timeout=10,
 
 
 def remote_login(client, host, port, username, password, prompt, linesep="\n",
-                 log_filename=None, timeout=10, interface=None,
-                 status_test_command="echo $?", verbose=False, bind_ip=None):
+                 log_filename=None, timeout=10, interface=None, identity_file=None,
+                 status_test_command="echo $?", verbose=False, bind_ip=None,
+                 preferred_authenticaton='password'):
     """
     Log into a remote host (guest) using SSH/Telnet/Netcat.
 
@@ -246,13 +257,16 @@ def remote_login(client, host, port, username, password, prompt, linesep="\n",
     :param timeout: The maximal time duration (in seconds) to wait for
             each step of the login procedure (i.e. the "Are you sure" prompt
             or the password prompt)
-    :interface: The interface the neighbours attach to (only use when
-                using ipv6 linklocal address.)
+    :param interface: The interface the neighbours attach to (only use when
+                      using ipv6 linklocal address.)
+    :param identity_file: Selects a file from which the identity (private key)
+                          for public key authentication is read
     :param status_test_command: Command to be used for getting the last
             exit status of commands run inside the shell (used by
             cmd_status_output() and friends).
     :param bind_ip: ssh through specific interface on
                     client(specify interface ip)
+    :param preferred_authenticaton: The preferred authentication of SSH connection
     :raise LoginError: If using ipv6 linklocal but not assign a interface that
                        the neighbour attache
     :raise LoginBadClientError: If an unknown client is requested
@@ -266,16 +280,16 @@ def remote_login(client, host, port, username, password, prompt, linesep="\n",
                              "be assigned")
         host = "%s%%%s" % (host, interface)
     if client == "ssh":
-        if not bind_ip:
-            cmd = ("ssh %s -o UserKnownHostsFile=/dev/null "
-                   "-o StrictHostKeyChecking=no "
-                   "-o PreferredAuthentications=password -p %s %s@%s" %
-                   (verbose, port, username, host))
+        cmd = ("ssh %s -o UserKnownHostsFile=/dev/null "
+               "-o StrictHostKeyChecking=no -p %s" %
+               (verbose, port))
+        if bind_ip:
+            cmd += (" -b %s" % bind_ip)
+        if identity_file:
+            cmd += (" -i %s" % identity_file)
         else:
-            cmd = ("ssh %s -o UserKnownHostsFile=/dev/null "
-                   "-o StrictHostKeyChecking=no "
-                   "-o PreferredAuthentications=password -p %s -b %s %s@%s" %
-                   (verbose, port, bind_ip, username, host))
+            cmd += " -o PreferredAuthentications=%s" % preferred_authenticaton
+        cmd += " %s@%s" % (username, host)
     elif client == "telnet":
         cmd = "telnet -l %s %s %s" % (username, host, port)
     elif client == "nc":
@@ -377,7 +391,8 @@ def remote_commander(client, host, port, username, password, prompt,
 
 def wait_for_login(client, host, port, username, password, prompt,
                    linesep="\n", log_filename=None, timeout=240,
-                   internal_timeout=10, interface=None):
+                   internal_timeout=10, interface=None,
+                   preferred_authenticaton='password'):
     """
     Make multiple attempts to log into a guest until one succeeds or timeouts.
 
@@ -385,6 +400,7 @@ def wait_for_login(client, host, port, username, password, prompt,
     :param internal_timeout: The maximum time duration (in seconds) to wait for
                              each step of the login procedure (e.g. the
                              "Are you sure" prompt or the password prompt)
+    :param preferred_authenticaton: The preferred authentication of SSH connection
     :interface: The interface the neighbours attach to
                 (only use when using ipv6 linklocal address.)
     :see: remote_login()
@@ -399,14 +415,16 @@ def wait_for_login(client, host, port, username, password, prompt,
         try:
             return remote_login(client, host, port, username, password, prompt,
                                 linesep, log_filename, internal_timeout,
-                                interface, verbose=verbose)
+                                interface, verbose=verbose,
+                                preferred_authenticaton=preferred_authenticaton)
         except LoginError as e:
             logging.debug(e)
             verbose = True
         time.sleep(2)
     # Timeout expired; try one more time but don't catch exceptions
     return remote_login(client, host, port, username, password, prompt,
-                        linesep, log_filename, internal_timeout, interface)
+                        linesep, log_filename, internal_timeout, interface,
+                        preferred_authenticaton=preferred_authenticaton)
 
 
 def _remote_scp(
@@ -959,6 +977,44 @@ def copy_files_from(address, client, username, password, port, remote_path,
                                    "values are scp and rss" % client)
 
 
+def run_remote_cmd(cmd, params, remote_runner=None, ignore_status=True):
+    """
+    A function to run a command on remote host.
+
+    :param cmd: the command to be executed
+    :param params: the parameter for executing
+    :param remote_runner: a remote runner object on remote host
+    :param ignore_status: True - not raise exception when failed
+                          False - raise exception when failed
+
+    :return: CmdResult object
+    :raise: exceptions.TestFail or exceptions.TestError
+    """
+    try:
+        if not remote_runner:
+            remote_ip = params.get("server_ip", params.get("remote_ip"))
+            remote_pwd = params.get("server_pwd", params.get("remote_pwd"))
+            remote_user = params.get("server_user", params.get("remote_user"))
+            remote_runner = RemoteRunner(host=remote_ip,
+                                         username=remote_user,
+                                         password=remote_pwd)
+
+        cmdresult = remote_runner.run(cmd, ignore_status=ignore_status)
+        logging.debug("Remote runner run result:\n%s", cmdresult)
+        if cmdresult.exit_status and not ignore_status:
+            raise exceptions.TestFail("Failed to run '%s' on remote: %s"
+                                      % (cmd, cmdresult))
+        return cmdresult
+    except (LoginError, LoginTimeoutError,
+            LoginAuthenticationError, LoginProcessTerminatedError) as e:
+        logging.error(e)
+        raise exceptions.TestError(e)
+    except process.CmdError as cmderr:
+        logging.error("Remote runner run failed:\n%s", cmderr)
+        raise exceptions.TestFail("Failed to run '%s' on remote: %s"
+                                  % (cmd, cmderr))
+
+
 class Remote_Package(object):
 
     def __init__(self, address, client, username, password, port, remote_path):
@@ -1229,7 +1285,7 @@ class RemoteRunner(object):
     def __init__(self, client="ssh", host=None, port="22", username="root",
                  password=None, prompt=r"[\#\$]\s*$", linesep="\n",
                  log_filename=None, timeout=240, internal_timeout=10,
-                 session=None):
+                 session=None, preferred_authenticaton='password'):
         """
         Initialization of RemoteRunner. Init a session login to remote host or
         guest.
@@ -1248,6 +1304,7 @@ class RemoteRunner(object):
                 for each step of the login procedure (e.g. the "Are you sure"
                 prompt or the password prompt)
         :param session: An existing session
+        :param preferred_authenticaton: The preferred authentication of SSH connection
         :see: wait_for_login()
         :raise: Whatever wait_for_login() raises
         """
@@ -1258,7 +1315,8 @@ class RemoteRunner(object):
             self.session = wait_for_login(client, host, port, username,
                                           password, prompt, linesep,
                                           log_filename, timeout,
-                                          internal_timeout)
+                                          internal_timeout,
+                                          preferred_authenticaton=preferred_authenticaton)
         else:
             self.session = session
         # Init stdout pipe and stderr pipe.

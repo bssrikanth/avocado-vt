@@ -2,6 +2,7 @@ import re
 import os
 import socket
 import fcntl
+import errno
 import struct
 import logging
 import random
@@ -12,6 +13,8 @@ import signal
 import netifaces
 import netaddr
 import platform
+import uuid
+import hashlib
 
 import aexpect
 from avocado.core import exceptions
@@ -29,6 +32,8 @@ from virttest import utils_misc
 from virttest import arch
 from virttest.compat_52lts import results_stdout_52lts, results_stderr_52lts, decode_to_text
 from virttest.versionable_class import factory
+from virttest.utils_windows import virtio_win
+from virttest.utils_windows import system
 
 
 try:
@@ -390,52 +395,69 @@ class Interface(object):
                                     self.name, id(self))
 
     @warp_init_del
+    def set_iface_flag(self, flag, active=True):
+        # Get existing device flags
+        ifreq = struct.pack('16sh', self.name.encode(), 0)
+        flags = struct.unpack('16sh',
+                              fcntl.ioctl(sockfd, arch.SIOCGIFFLAGS, ifreq))[1]
+
+        # Set new flags
+        if active:
+            flags = flags | flag
+        else:
+            flags = flags & ~flag
+
+        ifreq = struct.pack('16sh', self.name.encode(), flags)
+        fcntl.ioctl(sockfd, arch.SIOCSIFFLAGS, ifreq)
+
+    @warp_init_del
+    def is_iface_flag_on(self, flag):
+        ifreq = struct.pack('16sh', self.name.encode(), 0)
+        flags = struct.unpack('16sh',
+                              fcntl.ioctl(sockfd, arch.SIOCGIFFLAGS, ifreq))[1]
+
+        if flags & flag:
+            return True
+        else:
+            return False
+
     def up(self):
         '''
         Bring up the bridge interface. Equivalent to ifconfig [iface] up.
         '''
+        self.set_iface_flag(arch.IFF_UP)
 
-        # Get existing device flags
-        ifreq = struct.pack('16sh', self.name.encode(), 0)
-        flags = struct.unpack('16sh',
-                              fcntl.ioctl(sockfd, arch.SIOCGIFFLAGS, ifreq))[1]
-
-        # Set new flags
-        flags = flags | arch.IFF_UP
-        ifreq = struct.pack('16sh', self.name.encode(), flags)
-        fcntl.ioctl(sockfd, arch.SIOCSIFFLAGS, ifreq)
-
-    @warp_init_del
     def down(self):
         '''
-        Bring up the bridge interface. Equivalent to ifconfig [iface] down.
+        Bring down the bridge interface. Equivalent to ifconfig [iface] down.
         '''
+        self.set_iface_flag(arch.IFF_UP, active=False)
 
-        # Get existing device flags
-        ifreq = struct.pack('16sh', self.name.encode(), 0)
-        flags = struct.unpack('16sh',
-                              fcntl.ioctl(sockfd, arch.SIOCGIFFLAGS, ifreq))[1]
-
-        # Set new flags
-        flags = flags & ~arch.IFF_UP
-        ifreq = struct.pack('16sh', self.name.encode(), flags)
-        fcntl.ioctl(sockfd, arch.SIOCSIFFLAGS, ifreq)
-
-    @warp_init_del
     def is_up(self):
         '''
         Return True if the interface is up, False otherwise.
         '''
-        # Get existing device flags
-        ifreq = struct.pack('16sh', self.name.encode(), 0)
-        flags = struct.unpack('16sh',
-                              fcntl.ioctl(sockfd, arch.SIOCGIFFLAGS, ifreq))[1]
+        return self.is_iface_flag_on(arch.IFF_UP)
 
-        # Set new flags
-        if flags & arch.IFF_UP:
-            return True
-        else:
-            return False
+    def promisc_on(self):
+        '''
+        Enable promiscuous mode on the interface.
+        Equivalent to ip link set [iface] promisc on.
+        '''
+        self.set_iface_flag(arch.IFF_PROMISC)
+
+    def promisc_off(self):
+        '''
+        Disable promiscuous mode on the interface.
+        Equivalent to ip link set [iface] promisc off.
+        '''
+        self.set_iface_flag(arch.IFF_PROMISC, active=False)
+
+    def is_promisc(self):
+        '''
+        Return True if the interface promiscuous mode is on, False otherwise.
+        '''
+        return self.is_iface_flag_on(arch.IFF_PROMISC)
 
     @warp_init_del
     def get_mac(self):
@@ -517,6 +539,26 @@ class Interface(object):
         ifreq = struct.pack('16sH2si8s', self.name.encode(),
                             socket.AF_INET, b'\x00' * 2, nmbytes, b'\x00' * 8)
         fcntl.ioctl(sockfd, arch.SIOCSIFNETMASK, ifreq)
+
+    @warp_init_del
+    def get_mtu(self):
+        '''
+        Get MTU size of the interface
+        '''
+        ifreq = struct.pack('16sH14s', self.name.encode(),
+                            socket.AF_INET, b'\x00' * 14)
+        res = fcntl.ioctl(sockfd, arch.SIOCGIFMTU, ifreq)
+
+        return struct.unpack('16sH14s', res)[1]
+
+    @warp_init_del
+    def set_mtu(self, newmtu):
+        '''
+        Set MTU size of the interface
+        '''
+        ifreq = struct.pack('16sH14s', self.name.encode(),
+                            newmtu, b'\x00' * 14)
+        fcntl.ioctl(sockfd, arch.SIOCSIFMTU, ifreq)
 
     @warp_init_del
     def get_index(self):
@@ -1008,8 +1050,16 @@ class Bridge(object):
         result = dict()
         for br_iface in os.listdir(sysfs_path):
             br_iface_path = os.path.join(sysfs_path, br_iface)
-            if "bridge" not in os.listdir(br_iface_path):
-                continue
+            try:
+                if (not os.path.isdir(br_iface_path) or
+                        "bridge" not in os.listdir(br_iface_path)):
+                    continue
+            except OSError as e:
+                if e.errno == errno.ENOENT:
+                    continue
+                else:
+                    raise e
+
             result[br_iface] = dict()
             # Get stp_state
             stp_state_path = os.path.join(br_iface_path, "bridge", "stp_state")
@@ -1025,10 +1075,14 @@ class Bridge(object):
     def list_br(self):
         return list(self.get_structure().keys())
 
-    def list_iface(self):
+    def list_iface(self, br=None):
         """
         Return all interfaces used by bridge.
+
+        :param br: Name of bridge
         """
+        if br:
+            return self.get_structure()[br]['iface']
         interface_list = []
         for br in self.list_br():
             for (value) in self.get_structure()[br]['iface']:
@@ -1259,22 +1313,19 @@ def local_runner_status(cmd, timeout=None, shell=False):
     return process.run(cmd, verbose=False, timeout=timeout, shell=shell).exit_status
 
 
-def get_net_if(runner=None, state=None):
+def get_net_if(runner=local_runner, state=".*", qdisc=".*", optional=".*"):
     """
     :param runner: command runner.
-    :param div_phy_virt: if set true, will return a tuple division real
-                         physical interface and virtual interface
+    :param state: interface state get from ip link
+    :param qdisc: interface qdisc get from ip link
+    :param optional: optional match for interface find
     :return: List of network interfaces.
     """
-    if runner is None:
-        runner = local_runner
-    if state is None:
-        state = ".*"
     cmd = "ip link"
     # As the runner converts stdout to unicode on Python2,
     # it has to be converted to string for struct.pack().
     result = str(runner(cmd))
-    return re.findall(r"^\d+: (\S+?)[@:].*state %s.*$" % (state),
+    return re.findall(r"^\d+: (\S+?)[@:].*%s.*%s.*state %s.*$" % (optional, qdisc, state),
                       result,
                       re.MULTILINE)
 
@@ -1380,7 +1431,7 @@ def get_net_if_and_addrs(runner=None):
 
 
 def get_guest_ip_addr(session, mac_addr, os_type="linux", ip_version="ipv4",
-                      linklocal=False):
+                      linklocal=False, timeout=1):
     """
     Get guest ip addresses by serial session
 
@@ -1389,41 +1440,46 @@ def get_guest_ip_addr(session, mac_addr, os_type="linux", ip_version="ipv4",
     :param os_type: guest os type, windows or linux
     :param ip_version: guest ip version, ipv4 or ipv6
     :param linklocal: Wether ip address is local or remote
+    :param timeout: Timeout for get ip addr
     :return: ip addresses of network interface.
     """
     info_cmd = ""
-    try:
-        if os_type == "linux":
-            nic_ifname = get_linux_ifname(session, mac_addr)
-            info_cmd = "ifconfig -a; ethtool -S %s" % nic_ifname
-            nic_address = get_net_if_addrs(nic_ifname,
-                                           session.cmd_output)
-        elif os_type == "windows":
-            info_cmd = "ipconfig /all"
-            nic_address = get_net_if_addrs_win(session, mac_addr)
-        else:
-            info_cmd = ""
-            raise ValueError("Unknown os type")
 
-        if ip_version == "ipv4":
-            linklocal_prefix = "169.254"
-        elif ip_version == "ipv6":
-            linklocal_prefix = "fe80"
-        else:
-            raise ValueError("Unknown ip version type")
-
+    timeout = time.time() + timeout
+    while time.time() < timeout:
         try:
-            if linklocal:
-                return [x for x in nic_address[ip_version]
-                        if x.lower().startswith(linklocal_prefix)][0]
+            if os_type == "linux":
+                nic_ifname = get_linux_ifname(session, mac_addr)
+                info_cmd = "ifconfig -a; ethtool -S %s" % nic_ifname
+                nic_address = get_net_if_addrs(nic_ifname,
+                                               session.cmd_output)
+            elif os_type == "windows":
+                info_cmd = "ipconfig /all"
+                nic_address = get_net_if_addrs_win(session, mac_addr)
             else:
-                return [x for x in nic_address[ip_version]
-                        if not x.lower().startswith(linklocal_prefix)][0]
-        except IndexError:
-            return None
-    except Exception as err:
-        logging.debug(session.cmd_output(info_cmd))
-        raise IPAddrGetError(mac_addr, err)
+                raise ValueError("Unknown os type")
+
+            if ip_version == "ipv4":
+                linklocal_prefix = "169.254"
+            elif ip_version == "ipv6":
+                linklocal_prefix = "fe80"
+            else:
+                raise ValueError("Unknown ip version type")
+
+            try:
+                if linklocal:
+                    return [x for x in nic_address[ip_version]
+                            if x.lower().startswith(linklocal_prefix)][0]
+                else:
+                    return [x for x in nic_address[ip_version]
+                            if not x.lower().startswith(linklocal_prefix)][0]
+            except IndexError:
+                time.sleep(1)
+        except Exception as err:
+            logging.debug(session.cmd_output(info_cmd))
+            raise IPAddrGetError(mac_addr, err)
+
+    return None
 
 
 def convert_netmask(mask):
@@ -1697,11 +1753,15 @@ def ipv6_from_mac_addr(mac_addr):
     return ":".join(map(lambda x: x.lstrip("0"), mac_address.split(":")))
 
 
-def refresh_neigh_table(interface_name=None, neigh_address="ff02::1"):
+def refresh_neigh_table(interface_name=None, neigh_address="ff02::1",
+                        session=None, timeout=60.0, **dargs):
     """
     Refresh host neighbours table, if interface_name is assigned only refresh
     neighbours of this interface, else refresh the all the neighbours.
     """
+    func = process.getoutput
+    if session:
+        func = session.cmd_output
     if isinstance(interface_name, list):
         interfaces = interface_name
     elif isinstance(interface_name, six.string_types):
@@ -1713,18 +1773,23 @@ def refresh_neigh_table(interface_name=None, neigh_address="ff02::1"):
     for interface in interfaces:
         refresh_cmd = "ping6 -c 2 -I %s %s > /dev/null" % (interface,
                                                            neigh_address)
-        process.system(refresh_cmd, ignore_status=True)
+        func(refresh_cmd, timeout=timeout, **dargs)
 
 
-def get_neighbours_info(neigh_address="", interface_name=None):
+def get_neighbours_info(neigh_address="", interface_name=None, session=None,
+                        timeout=60.0, **dargs):
     """
     Get the neighbours infomation
     """
-    refresh_neigh_table(interface_name, neigh_address)
+    refresh_neigh_table(interface_name, neigh_address, session=session,
+                        timeout=timeout, **dargs)
+    func = process.getoutput
+    if session:
+        func = session.cmd_output
     cmd = "ip -6 neigh show nud reachable"
     if neigh_address:
         cmd += " %s" % neigh_address
-    output = decode_to_text(process.system_output(cmd))
+    output = func(cmd, timeout=timeout, **dargs)
     if not output:
         raise VMIPV6NeighNotFoundError(neigh_address)
     all_neigh = {}
@@ -1740,29 +1805,33 @@ def get_neighbours_info(neigh_address="", interface_name=None):
     return all_neigh
 
 
-def neigh_reachable(neigh_address, attach_if=None):
+def neigh_reachable(neigh_address, attach_if=None, session=None, timeout=60.0,
+                    **dargs):
     """
     Check the neighbour is reachable
     """
     try:
-        get_neighbours_info(neigh_address, attach_if)
+        get_neighbours_info(neigh_address, attach_if, session=session,
+                            timeout=timeout, **dargs)
     except VMIPV6NeighNotFoundError:
         return False
     return True
 
 
-def get_neigh_attch_interface(neigh_address):
+def get_neigh_attch_interface(neigh_address, session=None, timeout=60.0, **dargs):
     """
-    Get the interface wihch can reach the neigh_address
+    Get the interface which can reach the neigh_address
     """
-    return get_neighbours_info(neigh_address)[neigh_address]["attach_if"]
+    return get_neighbours_info(neigh_address, session=session, timeout=timeout,
+                               **dargs)[neigh_address]["attach_if"]
 
 
-def get_neigh_mac(neigh_address):
+def get_neigh_mac(neigh_address, session=None, timeout=60.0, **dargs):
     """
     Get neighbour mac by his address
     """
-    return get_neighbours_info(neigh_address)[neigh_address]["mac"]
+    return get_neighbours_info(neigh_address, session=session, timeout=timeout,
+                               **dargs)[neigh_address]["mac"]
 
 
 def check_add_dnsmasq_to_br(br_name, tmpdir):
@@ -1887,7 +1956,10 @@ def ovs_br_exists(brname, ovs=None):
     if ovs is None:
         ovs = __ovs
 
-    return brname in ovs.list_br()
+    if ovs is not None:
+        return brname in ovs.list_br()
+    else:
+        raise exceptions.TestError("Host does not support OpenVSwitch")
 
 
 @__init_openvswitch
@@ -2305,6 +2377,66 @@ class IPv6Manager(propcan.PropCanBase):
         self.close_session()
 
 
+def ieee_eui_generator(base, mask, start=0, repeat=False):
+    """
+    IEEE extended unique identifier(EUI) generator.
+
+    :param base: The base identifier number.
+    :param mask: The mask to calculate identifiers.
+    :param start: The ordinal number of the first identifier.
+    :param repeat: Whether use repeated identifiers when exhausted.
+
+    :return generator: The target EUI generator.
+    """
+    offset = 0
+    while True:
+        out = base + ((start + offset) & mask)
+        yield out
+        offset += 1
+        if offset > mask:
+            if not repeat:
+                break
+            offset = 0
+
+
+def ieee_eui_assignment(eui_bits):
+    """
+    IEEE EUI assignment.
+
+    :param eui_bits: The number of EUI bits.
+    """
+    def assignment(oui_bits, prefix=0, repeat=False):
+        """
+        The template of assignment.
+
+        :param oui_bits: The number of OUI bits.
+        :param prefix: The prefix of OUI, for example 0x9a.
+        :param repeat: Whether use repeated identifiers when exhausted.
+        """
+        # Using UUID1 combine with `__file__` to avoid getting the same hash
+        data = uuid.uuid1().hex + __file__
+        data = hashlib.sha256(data.encode()).digest()[:(eui_bits // 8)]
+        sample = 0
+        for num in bytearray(data):
+            sample <<= 8
+            sample |= num
+        bits = eui_bits - oui_bits
+        mask = (1 << bits) - 1
+        start = sample & mask
+        base = sample ^ start
+        if prefix > 0:
+            pbits = eui_bits + (-(prefix.bit_length()) // 4) * 4
+            pmask = (1 << pbits) - 1
+            prefix <<= pbits
+            base = prefix | (base & pmask)
+        return ieee_eui_generator(base, mask, start, repeat=repeat)
+    return assignment
+
+
+ieee_eui48_assignment = ieee_eui_assignment(48)
+ieee_eui64_assignment = ieee_eui_assignment(64)
+
+
 class VirtIface(propcan.PropCan, object):
 
     """
@@ -2313,10 +2445,11 @@ class VirtIface(propcan.PropCan, object):
 
     __slots__ = ['nic_name', 'g_nic_name', 'mac', 'nic_model', 'ip',
                  'nettype', 'netdst']
-    # Make sure first byte generated is always zero and it follows
-    # the class definition.  This helps provide more predictable
-    # addressing while avoiding clashes between multiple NICs.
-    LASTBYTE = random.SystemRandom().randint(0x00, 0xff)
+    # Using MA-S assignment here, that means we can have at most 4096 unique
+    # identifiers (MAC addresses) on the same job instance. We may consider
+    # using bigger blocks for large-scale deployment, such as microVM
+    # applications
+    EUI48_ASSIGNMENT = ieee_eui48_assignment(36, repeat=True)
 
     def __getstate__(self):
         state = {}
@@ -2392,15 +2525,33 @@ class VirtIface(propcan.PropCan, object):
                 mac_bytes[byte_index] = "%x" % mac
         return mac_bytes
 
+    @staticmethod
+    def _int_to_int_list(number, align=0):
+        """
+        Convert integer to integer list split by byte.
+        """
+        out = []
+        while number > 0:
+            out.insert(0, number & 0xff)
+            number >>= 8
+        if not out:
+            out.append(0)
+        blen = len(out)
+        if align > blen:
+            out = ([0] * (align - blen)) + out
+        return out
+
     @classmethod
-    def generate_bytes(cls):
+    def _generate_eui48(cls, prefix=None):
         """
-        Return next byte from ring
+        Generate EUI-48.
         """
-        cls.LASTBYTE += 1
-        if cls.LASTBYTE > 0xff:
-            cls.LASTBYTE = 0
-        yield cls.LASTBYTE
+        out = next(cls.EUI48_ASSIGNMENT)
+        out = cls._int_to_int_list(out, 6)
+        if prefix:
+            for idx, num in enumerate(prefix):
+                out[idx] = num
+        return out
 
     @classmethod
     def complete_mac_address(cls, mac):
@@ -2411,11 +2562,11 @@ class VirtIface(propcan.PropCan, object):
         :raise: TypeError if mac is not a string or a list
         """
         mac = cls.mac_str_to_int_list(mac)
-        if len(mac) == 6:
-            return ":".join(cls.int_list_to_mac_str(mac))
-        for rand_byte in cls.generate_bytes():
-            mac.append(rand_byte)
-            return cls.complete_mac_address(cls.int_list_to_mac_str(mac))
+        nr_bytes = len(mac)
+        assert not (nr_bytes > 6)
+        if nr_bytes < 6:
+            mac = cls._generate_eui48(mac)
+        return ":".join(cls.int_list_to_mac_str(mac))
 
 
 class LibvirtIface(VirtIface):
@@ -2679,6 +2830,12 @@ class ParamsNet(VMNet):
                 except IndexError:
                     existing_value = None
                 nic_dict[propertea] = nic_params.get(propertea, existing_value)
+                if propertea == "netdst" and "shell:" in nic_dict[propertea]:
+                    nic_dict[propertea] = process.getoutput(
+                        nic_dict[propertea].split(':', 1)[1])
+                    if not nic_dict[propertea]:
+                        raise exceptions.TestError(
+                            "netdst is null, please check the shell command")
             result_list.append(nic_dict)
         VMNet.__init__(self, self.container_class, result_list)
 
@@ -2697,8 +2854,6 @@ class ParamsNet(VMNet):
         default_params['netdev_extra_params'] = ''
         nic_name_list = self.params.objects('nics')
         default_params['vlan'] = str(nic_name_list.index(nic_name))
-        if nic_params.get('enable_misx_vectors') == 'yes':
-            default_params['vectors'] = 2 * 1 + 2
         for key, val in list(default_params.items()):
             nic_params.setdefault(key, val)
 
@@ -3039,15 +3194,21 @@ class VirtNet(DbNet, ParamsNet):
         return self[nic_index_or_name].ifname
 
 
-def parse_arp():
+def parse_arp(session=None, timeout=60.0, **dargs):
     """
     Read /proc/net/arp, return a mapping of MAC to IP
 
+    :param session: ShellSession object of remote host
+    :param timeout: Timeout for commands executed
+    :param dargs: extra options for session/process commands
     :return: dict mapping MAC to IP
     """
     ret = {}
-    with open('/proc/net/arp') as arp_f:
-        arp_cache = arp_f.readlines()
+    func = process.getoutput
+    if session:
+        func = session.cmd_output
+    arp_cache = func('cat /proc/net/arp', timeout=timeout,
+                     **dargs).strip().split('\n')
 
     for line in arp_cache:
         mac = line.split()[3]
@@ -3067,22 +3228,28 @@ def parse_arp():
     return ret
 
 
-def verify_ip_address_ownership(ip, macs, timeout=20.0, devs=None):
+def verify_ip_address_ownership(ip, macs, timeout=60.0, devs=None,
+                                session=None):
     """
     Make sure a given IP address belongs to one of the given
     MAC addresses.
 
     :param ip: The IP address to be verified.
     :param macs: A list or tuple of MAC addresses.
+    :param timeout: Timeout for retry verifying IP and for commands
     :param devs: A set of network interfaces to check on. If is absent
                  then use route table to get a name for possible
                  network interfaces.
+    :param session: ShellSession object of remote host
     :return: True if ip is assigned to a MAC address in macs.
     """
-    def __arping(ip, macs, dev, timeout):
+    def __arping(ip, macs, dev, timeout, session=None, **dargs):
+        func = process.getoutput
+        if session:
+            func = session.cmd_output
         # Compile a regex that matches the given IP address and any of the
         # given MAC addresses from arping output
-        ip_map = parse_arp()
+        ip_map = parse_arp(session=session, timeout=timeout, **dargs)
         for mac in macs:
             if ip_map.get(mac) == ip:
                 return True
@@ -3090,9 +3257,10 @@ def verify_ip_address_ownership(ip, macs, timeout=20.0, devs=None):
         mac_regex = "|".join("(%s)" % mac for mac in macs)
         regex = re.compile(r"\b%s\b.*\b(%s)\b" % (ip, mac_regex), re.I)
         arping_bin = utils_path.find_command("arping")
+        if session:
+            arping_bin = func("which arping", timeout=timeout, **dargs)
         cmd = "%s --help" % arping_bin
-        if "-C count" in decode_to_text(process.system_output(cmd, shell=True, ignore_status=True,
-                                                              verbose=False)):
+        if "-C count" in func(cmd, timeout=timeout, **dargs):
             regex = re.compile(r"\b%s\b.*\b(%s)" % (mac_regex, ip), re.I)
             arping_cmd = "%s -C1 -c3 -w%d -I %s %s" % (arping_bin, int(timeout),
                                                        dev, ip)
@@ -3100,15 +3268,15 @@ def verify_ip_address_ownership(ip, macs, timeout=20.0, devs=None):
             arping_cmd = "%s -f -c3 -w%d -I %s %s" % (arping_bin, int(timeout),
                                                       dev, ip)
         try:
-            o = decode_to_text(process.system_output(arping_cmd, shell=True, verbose=False))
-        except process.CmdError:
+            o = func(arping_cmd, **dargs)
+        except (process.CmdError, aexpect.ShellError):
             return False
         return bool(regex.search(o))
 
-    def __verify_neigh(ip, macs, dev, timeout):
-        refresh_neigh_table(dev, ip)
+    def __verify_neigh(ip, macs, dev, timeout, session=None, **dargs):
+        refresh_neigh_table(dev, ip, session=session, timeout=timeout, **dargs)
         try:
-            neigh_mac = get_neigh_mac(ip)
+            neigh_mac = get_neigh_mac(ip, session=session, timeout=timeout, **dargs)
             for mac in macs:
                 if neigh_mac.lower() == mac.lower():
                     return True
@@ -3118,12 +3286,21 @@ def verify_ip_address_ownership(ip, macs, timeout=20.0, devs=None):
 
     ip_ver = netaddr.IPAddress(ip).version
 
+    func = process.getoutput
+    dargs = dict()
+    if session:
+        func = session.cmd_output
+        dargs["safe"] = True
+    else:
+        dargs["ignore_bg_processes"] = True
     if not devs:
         # Get the name of the bridge device for ip route cache
         ip_cmd = utils_path.find_command("ip")
+        if session:
+            ip_cmd = func("which ip", timeout=timeout, **dargs)
         ip_cmd = "%s route get %s; %s -%d route | grep default" % (
             ip_cmd, ip, ip_cmd, ip_ver)
-        output = process.getoutput(ip_cmd)
+        output = func(ip_cmd, timeout=timeout, **dargs)
         devs = set(re.findall(r"dev\s+(\S+)", output, re.I))
     if not devs:
         logging.debug("No path to %s in route table: %s" % (ip, output))
@@ -3132,9 +3309,12 @@ def verify_ip_address_ownership(ip, macs, timeout=20.0, devs=None):
     # TODO: use same verification function for both ipv4 and ipv6
     verify_func = __verify_neigh if ip_ver == 6 else __arping
     for dev in devs:
-        if verify_func(ip, macs, dev, timeout):
-            return True
-    return False
+        # VM might take some time to respond after migration
+        return bool(utils_misc.wait_for(lambda: verify_func(ip, macs, dev,
+                                                            timeout,
+                                                            session=session, **dargs),
+                                        timeout,
+                                        text="Retry verifying IP address"))
 
 
 def generate_mac_address_simple():
@@ -3666,3 +3846,303 @@ def block_specific_ip_by_time(ip_addr, block_time="1 seconds", runner=None):
                           runner(list_rules))
     except process.CmdError:
         logging.error("Failed to run command '%s'", cmd)
+
+
+def map_hostname_ipaddress(hostname_ip_dict, session=None):
+    """
+    Method to map ipaddress and hostname for resolving appropriately
+    in /etc/hosts file.
+
+    :param hostname_ip_dict: dict of Hostname and ipaddress to be mapped
+    :param session: configure the /etc/hosts for remote host
+
+    :return: True on successful mapping, False on failure
+    """
+    hosts_file = "/etc/hosts"
+    check_cmd = "cat %s" % hosts_file
+    func = process.getstatusoutput
+    if session:
+        func = session.cmd_status_output
+    for hostname, ipaddress in six.iteritems(hostname_ip_dict):
+        status, output = func(check_cmd)
+        if status != 0:
+            logging.error(output)
+            return False
+        pattern = "%s(\s+)%s$" % (ipaddress, hostname)
+        if not re.search(pattern, output):
+            cmd = "echo '%s %s' >> %s" % (ipaddress, hostname, hosts_file)
+            status, output = func(cmd)
+            if status != 0:
+                logging.error(output)
+                return False
+    logging.info("All the hostnames and IPs are mapped in %s", hosts_file)
+    return True
+
+
+def _get_traceview_path(session, params):
+    """
+    Get the proper traceview.exe path.
+
+    :param session: a session to send cmd
+    :param params: the test params
+    :return: the proper traceview path
+    """
+
+    traceview_path_template = params.get("traceview_path_template",
+                                         "WIN_UTILS:\\traceview\\%s\\%%PROCESSOR_ARCHITECTURE%%\\traceview.exe")
+    traceview_ver = "win10"
+    os_version = system.version(session)
+    main_ver = int(os_version.split('.')[0])
+    if main_ver < 10:
+        traceview_ver = "win8"
+    traceview_path_template = traceview_path_template % traceview_ver
+    return utils_misc.set_winutils_letter(session, traceview_path_template)
+
+
+def _get_pdb_path(session, driver_name):
+    """
+    Get the proper [driver_name].pdb path from iso.
+
+    :param session: a session to send cmd
+    :param driver_name: the driver name
+    :return: the proper pdb path
+    """
+
+    viowin_ltr = virtio_win.drive_letter_iso(session)
+    if not viowin_ltr:
+        err = "Could not find virtio-win drive in guest"
+        raise exceptions.TestError(err)
+    guest_name = virtio_win.product_dirname_iso(session)
+    if not guest_name:
+        err = "Could not get product dirname of the vm"
+        raise exceptions.TestError(err)
+    guest_arch = virtio_win.arch_dirname_iso(session)
+    if not guest_arch:
+        err = "Could not get architecture dirname of the vm"
+        raise exceptions.TestError(err)
+
+    pdb_middle_path = "%s\\%s" % (guest_name, guest_arch)
+    pdb_find_cmd = 'dir /b /s %s\\%s.pdb | findstr "\\%s\\\\"'
+    pdb_find_cmd %= (viowin_ltr, driver_name, pdb_middle_path)
+    pdb_path = session.cmd(pdb_find_cmd).strip()
+    logging.info("Found %s.pdb file at %s" % (driver_name, pdb_path))
+    return pdb_path
+
+
+def _prepare_traceview_windows(params, session, timeout=360):
+    """
+    Copy traceview.exe and corresponding pdb file to drive c: for future use.
+
+    :param params: the test params
+    :param session: a session to send command
+    :param timeout: the command execute timeout
+    :return: a tuple which consists of local traceview.exe and pdb file paths
+    """
+
+    copy_cmd = "xcopy %s %s /y"
+    dst_folder = "c:\\"
+    # copy traceview.exe
+    logging.info("Copy traceview.exe to drive %s" % dst_folder)
+    traceview_path = _get_traceview_path(session, params)
+    session.cmd(copy_cmd % (traceview_path, dst_folder))
+
+    # copy Netkvm.pdb
+    driver_name = params.get("driver_name", "netkvm")
+    logging.info("Locate %s.pdb and copy to drive %s" %
+                 (driver_name, dst_folder))
+    pdb_path = _get_pdb_path(session, driver_name)
+    session.cmd(copy_cmd % (pdb_path, dst_folder))
+
+    # return local file names
+    pdb_local_path = "%s%s.pdb" % (dst_folder, driver_name)
+    traceview_local_path = dst_folder + "traceview.exe"
+    return (pdb_local_path, traceview_local_path)
+
+
+def _get_msis_queues_from_traceview_output(output):
+    """
+    Extract MSIs&queues infomation from traceview log file output
+
+    :param output: the content of traceview processed log infomation
+    :return: a tuple of (msis, queues)
+    """
+    info_str = "Start checking dump content for MSIs&queues info"
+    logging.info(info_str)
+    search_exp = r'No MSIX, using (\d+) queue'
+    # special case for vectors = 0
+    queue_when_no_msi = re.search(search_exp, output)
+    if queue_when_no_msi:
+        return (0, int(queue_when_no_msi.group(1)))
+    search_exp = r'(\d+) MSIs, (\d+) queues'
+    search_res = re.search(search_exp, output)
+    if not search_res:
+        return (None, None)
+
+    msis_number = int(search_res.group(1))
+    queues_number = int(search_res.group(2))
+    return (msis_number, queues_number)
+
+
+def _wait_for_traceview_dump_finished(session, dump_file_path, timeout=100):
+    """
+    Check the dump file size periodically, untill the file size doesn't change,
+    considered the dump process has finished. Then kill the idled progress.
+
+    :param session: a session to send command
+    :param dump_file_path: the dump file to check
+    """
+    last_size = [0]
+    check_file_size_cmd = "for %%I in (%s) do @echo %%~zI" % dump_file_path
+
+    def _check_file_size_unchanged():
+        """
+        Check whether dump file size is changed, by comparing current
+        file size and last checked size. If unchanged, the dump process
+        is considered finished.
+        """
+        status, output = session.cmd_status_output(check_file_size_cmd)
+        if status or not output.isdigit():
+            return False
+        file_size = int(output)
+        if file_size != last_size[0]:
+            last_size[0] = file_size
+            return False
+        return True
+
+    utils_misc.wait_for(lambda: _check_file_size_unchanged(),
+                        timeout=timeout,
+                        step=10.0)
+    kill_cmd = "taskkill /im traceview.exe"
+    session.cmd(kill_cmd)
+
+
+def dump_traceview_log_windows(params, vm, timeout=360):
+    """
+    Dump traceview log file with nic restart panic
+    Steps:
+        1.Prepare traceview.exe & driver pdb files
+        2.Start traceview session
+        2.Restart network card to create panic
+        3.Stop traceview session and dump log file
+
+    :param params: test params
+    :param vm: target vm
+    :param timeout: timeout value for login
+    :return: the content of traceview log file
+    """
+    log_path = "c:\\logfile.etl"
+    clean_cmd = "del "
+    dump_file = "c:\\trace.txt"
+
+    session = vm.wait_for_login(timeout=timeout)
+    # prepare traceview environment
+    pdb_local_path, traceview_local_path = _prepare_traceview_windows(
+        params, session, timeout)
+    session.close()
+    start_traceview_cmd = "%s -start test_session -pdb %s -level 5 -flag 0x1fff -f %s" % (
+        traceview_local_path, pdb_local_path, log_path)
+    stop_traceview_cmd = "%s -stop test_session" % traceview_local_path
+    dump_cmd = "%s -process %s -pdb %s -o %s" % (
+        traceview_local_path, log_path, pdb_local_path, dump_file)
+    # start traceview
+    logging.info("Start trace view with pdb file")
+    session_serial = vm.wait_for_serial_login(timeout=timeout)
+    try:
+        session_serial.cmd(clean_cmd + log_path)
+        session_serial.cmd(start_traceview_cmd, timeout=timeout)
+        # restart nic
+        logging.info("Restart guest nic")
+        mac = vm.get_mac_address(0)
+        connection_id = get_windows_nic_attribute(
+            session_serial, "macaddress", mac, "netconnectionid")
+        restart_windows_guest_network(session_serial, connection_id)
+        # stop traceview
+        logging.info("Stop traceview")
+        session_serial.cmd(stop_traceview_cmd, timeout=timeout)
+        # checkout traceview output
+        logging.info("Check etl file generated by traceview")
+        session_serial.cmd(clean_cmd + dump_file)
+        status, output = session_serial.cmd_status_output(dump_cmd)
+        if status:
+            logging.error("Cann't dump log file %s: %s" % (log_path, output))
+        _wait_for_traceview_dump_finished(session_serial, dump_file)
+        status, output = session_serial.cmd_status_output(
+            "type %s" % dump_file)
+        if status:
+            raise exceptions.TestError(
+                "Cann't read dumped file %s: %s" % (dump_file, output))
+        return output
+    finally:
+        session_serial.close()
+
+
+def get_msis_and_queues_windows(params, vm, timeout=360):
+    """
+    Get MSIs&queues' infomation of current windows guest.
+    First start a traceview session, then restart the nic interface
+    to trigger logging. By analyzing the dumped output, the MSIs&queues
+    info is acquired.
+
+    :param params: the test params
+    :param vm: target vm
+    :param timeout: the timeout of login
+    :return: a tuple of (msis, queues)
+    """
+    output = dump_traceview_log_windows(params, vm, timeout)
+    return _get_msis_queues_from_traceview_output(output)
+
+
+def set_netkvm_param_value(vm, param, value):
+    """
+    Set the value of certain 'param' in netkvm driver to 'value'
+    This funcion will restart the first nic, so all the sessions
+    opened before this function need close before this function is called.
+
+    param vm: the target vm
+    param param: the param
+    param value: the value
+    """
+
+    session = vm.wait_for_serial_login(timeout=360)
+    try:
+        logging.info("Set %s to %s" % (param, value))
+        cmd = 'netsh netkvm setparam 0 param=%s value=%s'
+        cmd = cmd % (param, value)
+        status, output = session.cmd_status_output(cmd)
+        if status:
+            err = "Error occured when set %s to value %s. " % (param, value)
+            err += "With status=%s, output=%s" % (status, output)
+            raise exceptions.TestError(err)
+
+        logging.info("Restart nic to apply changes")
+        dev_mac = vm.virtnet[0].mac
+        connection_id = get_windows_nic_attribute(
+            session, "macaddress", dev_mac, "netconnectionid")
+        restart_windows_guest_network(session, connection_id)
+        time.sleep(10)
+    finally:
+        session.close()
+
+
+def get_netkvm_param_value(vm, param):
+    """
+    Get the value of certain 'param' in netkvm driver.
+
+    param vm: the target vm
+    param param: the param
+    return: the value of the param
+    """
+
+    session = vm.wait_for_serial_login(timeout=360)
+    try:
+        logging.info("Get the value of %s" % param)
+        cmd = 'netsh netkvm getparam 0 param=%s' % param
+        status, output = session.cmd_status_output(cmd)
+        if status:
+            err = "Error occured when get value of %s. " % param
+            err += "With status=%s, output=%s" % (status, output)
+            raise exceptions.TestError(err)
+        value = output.strip().split('=')[1].strip()
+        return value
+    finally:
+        session.close()

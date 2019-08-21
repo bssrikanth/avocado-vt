@@ -51,6 +51,8 @@ from virttest import test_setup
 from virttest import data_dir
 from virttest import utils_libvirtd
 from virttest import utils_config
+from virttest import utils_iptables
+
 from virttest.utils_iptables import Iptables
 from virttest.staging import lv_utils
 from virttest.utils_libvirtd import service_libvirtd_control
@@ -64,11 +66,15 @@ from virttest.libvirt_xml import pool_xml
 from virttest.libvirt_xml import nwfilter_xml
 from virttest.libvirt_xml import vol_xml
 from virttest.libvirt_xml import secret_xml
+from virttest.libvirt_xml import CapabilityXML
+from virttest.libvirt_xml import base
 from virttest.libvirt_xml.devices import disk
 from virttest.libvirt_xml.devices import hostdev
 from virttest.libvirt_xml.devices import controller
+from virttest.libvirt_xml.devices import redirdev
 from virttest.libvirt_xml.devices import seclabel
 from virttest.libvirt_xml.devices import channel
+from virttest.libvirt_xml.devices import interface
 
 ping = utils_net.ping
 
@@ -154,6 +160,56 @@ class LibvirtNetwork(object):
         virsh.net_destroy(self.name)
         if self.persistent:
             virsh.net_undefine(self.name)
+
+
+def create_macvtap_vmxml(iface, params):
+    """
+    Method to create Macvtap interface xml for VM
+
+    :param iface: macvtap interface name
+    :param params: Test dict params for macvtap config
+
+    :return: macvtap xml object
+    """
+    mode = params.get('macvtap_mode', 'passthrough')
+    model = params.get('macvtap_model', 'virtio')
+    macvtap_type = params.get('macvtap_type', 'direct')
+    macvtap = interface.Interface(macvtap_type)
+    macvtap.mac_address = utils_net.generate_mac_address_simple()
+    macvtap.model = model
+    macvtap.source = {'dev': iface, 'mode': mode}
+    return macvtap
+
+
+def get_machine_types(arch, virt_type, virsh_instance=base.virsh, ignore_status=True):
+    """
+    Method to get all supported machine types
+
+    :param arch: architecture of the machine
+    :param virt_type: virtualization type hvm or pv
+    :param virsh_instance: virsh instance object
+    :param ignore_status: False to raise Error, True to ignore
+
+    :return: list of machine types supported
+    """
+    machine_types = []
+    try:
+        capability = CapabilityXML(virsh_instance=virsh_instance)
+        machine_types = capability.guest_capabilities[virt_type][arch]['machine']
+        return machine_types
+    except KeyError as detail:
+        if ignore_status:
+            return machine_types
+        else:
+            if detail.args[0] == virt_type:
+                raise KeyError("No libvirt support for %s virtualization, "
+                               "does system hardware + software support it?"
+                               % virt_type)
+            elif detail.args[0] == arch:
+                raise KeyError("No libvirt support for %s virtualization of "
+                               "%s, does system hardware + software support "
+                               "it?" % (virt_type, arch))
+            raise exceptions.TestError(detail)
 
 
 def cpus_parser(cpulist):
@@ -424,7 +480,8 @@ def setup_or_cleanup_nfs(is_setup, mount_dir="nfs-mount", is_mount=False,
                          mount_options="rw",
                          export_dir="nfs-export",
                          restore_selinux="",
-                         rm_export_dir=True):
+                         rm_export_dir=True,
+                         set_selinux_permissive=False):
     """
     Set SElinux to "permissive" and Set up nfs service on localhost.
     Or clean up nfs service on localhost and restore SElinux.
@@ -455,6 +512,8 @@ def setup_or_cleanup_nfs(is_setup, mount_dir="nfs-mount", is_mount=False,
                       Default to "nfs-export".
     :param rm_export_dir: Boolean, True for forcely removing nfs export dir
                                    False for keeping nfs export dir
+    :param set_selinux_permissive: Boolean, True to set selinux to permissive
+                                   mode, False not set.
     :return: A dict contains export and mount result parameters:
              export_dir: Absolute directory of exported local NFS file system.
              mount_dir: Absolute directory NFS file system mounted on.
@@ -480,11 +539,16 @@ def setup_or_cleanup_nfs(is_setup, mount_dir="nfs-mount", is_mount=False,
     _nfs = nfs.Nfs(nfs_params)
 
     if is_setup:
-        # Set selinux to permissive that the file in nfs
-        # can be used freely
         if not ubuntu and utils_selinux.is_enforcing():
-            utils_selinux.set_status("permissive")
-
+            if set_selinux_permissive:
+                utils_selinux.set_status("permissive")
+                logging.debug("selinux set to permissive mode, "
+                              "this is not recommended, potential access "
+                              "control error could be missed.")
+            else:
+                logging.debug("selinux is in enforcing mode, libvirt needs "
+                              "\"setsebool virt_use_nfs on\" to get "
+                              "nfs access right.")
         _nfs.setup()
         if not is_mount:
             _nfs.umount()
@@ -570,12 +634,13 @@ def get_host_ipv4_addr():
 
 
 def setup_or_cleanup_gluster(is_setup, vol_name, brick_path="", pool_name="",
-                             file_path="/etc/glusterfs/glusterd.vol"):
+                             file_path="/etc/glusterfs/glusterd.vol", **kwargs):
     """
     Set up or clean up glusterfs environment on localhost
     :param is_setup: Boolean value, true for setup, false for cleanup
     :param vol_name: gluster created volume name
     :param brick_path: Dir for create glusterfs
+    :param kwargs: Other parameters that need to set for gluster
     :return: ip_addr or nothing
     """
     try:
@@ -585,21 +650,38 @@ def setup_or_cleanup_gluster(is_setup, vol_name, brick_path="", pool_name="",
     if not brick_path:
         tmpdir = data_dir.get_tmp_dir()
         brick_path = os.path.join(tmpdir, pool_name)
+
+    # Check gluster server apply or not
+    ip_addr = kwargs.get("gluster_server_ip", "")
+    session = None
+    if ip_addr != "":
+        remote_user = kwargs.get("gluster_server_user")
+        remote_pwd = kwargs.get("gluster_server_pwd")
+        remote_identity_file = kwargs.get("gluster_identity_file")
+        session = remote.remote_login("ssh", ip_addr, "22",
+                                      remote_user, remote_pwd, "#",
+                                      identity_file=remote_identity_file)
     if is_setup:
-        ip_addr = get_host_ipv4_addr()
-        gluster.add_rpc_insecure(file_path)
-        gluster.glusterd_start()
-        logging.debug("finish start gluster")
-        gluster.gluster_vol_create(vol_name, ip_addr, brick_path, force=True)
-        gluster.gluster_allow_insecure(vol_name)
-        gluster.gluster_nfs_disable(vol_name)
-        logging.debug("The contents of %s: \n%s", file_path, open(file_path).read())
+        if ip_addr == "":
+            ip_addr = get_host_ipv4_addr()
+            gluster.add_rpc_insecure(file_path)
+            gluster.glusterd_start()
+            logging.debug("finish start gluster")
+            logging.debug("The contents of %s: \n%s", file_path, open(file_path).read())
+
+        gluster.gluster_vol_create(vol_name, ip_addr, brick_path, True, session)
+        gluster.gluster_allow_insecure(vol_name, session)
+        gluster.gluster_nfs_disable(vol_name, session)
         logging.debug("finish vol create in gluster")
+        if session:
+            session.close()
         return ip_addr
     else:
-        gluster.gluster_vol_stop(vol_name, True)
-        gluster.gluster_vol_delete(vol_name)
-        gluster.gluster_brick_delete(brick_path)
+        gluster.gluster_vol_stop(vol_name, True, session)
+        gluster.gluster_vol_delete(vol_name, session)
+        gluster.gluster_brick_delete(brick_path, session)
+        if session:
+            session.close()
         return ""
 
 
@@ -676,7 +758,7 @@ def define_pool(pool_name, pool_type, pool_target, cleanup_flag, **kwargs):
 
         # Prepare gluster service and create volume
         hostip = setup_or_cleanup_gluster(True, gluster_source_name,
-                                          pool_name=pool_name)
+                                          pool_name=pool_name, **kwargs)
         logging.debug("hostip is %s", hostip)
         # create image in gluster volume
         file_path = "gluster://%s/%s" % (hostip, gluster_source_name)
@@ -858,27 +940,6 @@ def mkfs(partition, fs_type, options="", session=None):
         process.run(mkfs_cmd)
 
 
-def get_parts_list(session=None):
-    """
-    Get all partition lists.
-    """
-    parts_cmd = "cat /proc/partitions"
-    if session:
-        _, parts_out = session.cmd_status_output(parts_cmd)
-    else:
-        parts_out = results_stdout_52lts(process.run(parts_cmd))
-    parts = []
-    if parts_out:
-        for line in parts_out.rsplit("\n"):
-            if line.startswith("major") or line == "":
-                continue
-            parts_line = line.rsplit()
-            if len(parts_line) == 4:
-                parts.append(parts_line[3])
-    logging.debug("Find parts: %s" % parts)
-    return parts
-
-
 def yum_install(pkg_list, session=None):
     """
     Try to install packages on system
@@ -974,7 +1035,7 @@ class PoolVolumeTest(object):
                     shutil.rmtree(pool_target)
             if pool_type == "gluster" or source_format == 'glusterfs':
                 setup_or_cleanup_gluster(False, source_name,
-                                         pool_name=pool_name)
+                                         pool_name=pool_name, **kwargs)
 
     def pre_pool(self, pool_name, pool_type, pool_target, emulated_image,
                  **kwargs):
@@ -1055,7 +1116,7 @@ class PoolVolumeTest(object):
                 os.mkdir(pool_target)
             if source_format == 'glusterfs':
                 hostip = setup_or_cleanup_gluster(True, source_name,
-                                                  pool_name=pool_name)
+                                                  pool_name=pool_name, **kwargs)
                 logging.debug("hostip is %s", hostip)
                 extra = "--source-host %s --source-path %s" % (hostip,
                                                                source_name)
@@ -1134,8 +1195,9 @@ class PoolVolumeTest(object):
                 self.params['scsi_xml_file'] = scsi_xml_file
         elif pool_type == "gluster":
             source_path = kwargs.get('source_path')
+            logging.info("source path is %s" % source_path)
             hostip = setup_or_cleanup_gluster(True, source_name,
-                                              pool_name=pool_name)
+                                              pool_name=pool_name, **kwargs)
             logging.debug("Gluster host ip address: %s", hostip)
             extra = "--source-host %s --source-path %s --source-name %s" % \
                     (hostip, source_path, source_name)
@@ -1218,13 +1280,45 @@ class MigrationTest(object):
         # The CmdResult returned from virsh migrate command
         self.ret = None
 
-    def ping_vm(self, vm, test, params, uri=None, ping_count=10,
+    def post_migration_check(self, vms, params, uptime, uri=None):
+        """
+        Validating migration by performing checks in this method
+        * uptime of the migrated vm > uptime of vm before migration
+        * ping vm from target host
+        * check vm state after migration
+
+        :param vms: VM objects of migrating vms
+        :param uptime: uptime dict of vms before migration
+        :param uri: target virsh uri
+        :return: updated dict of uptime
+        """
+        vm_state = params.get("virsh_migrated_state", "running")
+        ping_count = int(params.get("ping_count", 10))
+        for vm in vms:
+            if not self.check_vm_state(vm.name, vm_state, uri=uri):
+                raise exceptions.TestFail("Migrated VMs failed to be in %s "
+                                          "state at destination" % vm_state)
+            logging.info("Guest state is '%s' at destination is as expected",
+                         vm_state)
+            if "offline" not in params.get("migrate_options"):
+                vm_uptime = vm.uptime(connect_uri=uri)
+                logging.info("uptime of migrated VM %s: %s", vm.name,
+                             vm_uptime)
+                if vm_uptime < uptime[vm.name]:
+                    raise exceptions.TestFail("vm went for a reboot during "
+                                              "migration")
+                self.ping_vm(vm, params, uri=uri, ping_count=ping_count)
+                # update vm uptime to check when migrating back
+                uptime[vm.name] = vm_uptime
+                vm.verify_dmesg(connect_uri=uri)
+        return uptime
+
+    def ping_vm(self, vm, params, uri=None, ping_count=10,
                 ping_timeout=60):
         """
         Method used to ping the VM before and after migration
 
         :param vm: VM object
-        :param test: test object
         :param params: Test dict params
         :param uri: connect uri
         :param ping_count: count of icmp packet
@@ -1232,17 +1326,18 @@ class MigrationTest(object):
         """
         vm_ip = params.get("vm_ip_dict", {})
         server_session = None
-        func = test.error
-        if uri:
-            func = test.fail
-            server_ip = params.get("server_ip")
+        func = exceptions.TestError
+        if uri and uri != "qemu:///system":
+            func = exceptions.TestFail
             src_uri = "qemu:///system"
             vm.connect_uri = uri
-            server_pwd = params.get("server_pwd")
-            server_user = params.get("server_user")
-            server_session = remote.wait_for_login('ssh', server_ip, '22',
-                                                   server_user, server_pwd,
-                                                   r"[\#\$]\s*$")
+            server_session = test_setup.remote_session(params)
+            # after migration VM would take some time to respond and to
+            # avoid the race of framework querying IP address before VM
+            # starts responding, provide timeout for 120 seconds to retry
+            # and raise if VM fails to respond
+            vm_ip[vm.name] = vm.get_address(session=server_session,
+                                            timeout=120)
             logging.info("Check VM network connectivity after migrating")
         else:
             logging.info("Check VM network connectivity before migration")
@@ -1257,8 +1352,9 @@ class MigrationTest(object):
                                         session=server_session)
         logging.info(o_ping)
         if uri:
-            server_session.close()
             vm.connect_uri = src_uri
+            if server_session:
+                server_session.close()
         if s_ping != 0:
             if uri:
                 if "offline" in params.get("migrate_options"):
@@ -1320,30 +1416,59 @@ class MigrationTest(object):
         :param cleanup: if True revert back to default setting, used to cleanup
         :param ports: ports used for allowing migration
         """
-        iptable_rule = ["INPUT -p tcp -m tcp --dport %s -j ACCEPT" % ports]
+        use_firewall_cmd = distro.detect().name != "Ubuntu"
+        try:
+            utils_path.find_command("firewall-cmd")
+        except utils_path.CmdNotFoundError:
+            logging.debug("Using iptables for replacement")
+            use_firewall_cmd = False
+
+        if use_firewall_cmd:
+            port_to_add = ports
+            if ":" in ports:
+                port_to_add = "%s-%s" % (ports.split(":")[0], ports.split(":")[1])
+        else:
+            rule = ["INPUT -p tcp -m tcp --dport %s -j ACCEPT" % ports]
+
         try:
             dest_ip = re.search(r'//.*/', desturi,
                                 re.I).group(0).strip('/').strip()
             source_ip = params.get("migrate_source_host", "").strip()
             # check whether migrate back to source machine or not
             if ((desturi == "qemu:///system") or (dest_ip == source_ip)):
-                # open migration ports in local machine using iptables
-                Iptables.setup_or_cleanup_iptables_rules(iptable_rule,
-                                                         cleanup=cleanup)
+                if use_firewall_cmd:
+                    firewall_cmd = utils_iptables.Firewall_cmd()
+                    if cleanup:
+                        firewall_cmd.remove_port(port_to_add, 'tcp', permanent=True)
+                    else:
+                        firewall_cmd.add_port(port_to_add, 'tcp', permanent=True)
+                    # open migration ports in local machine using firewall_cmd
+                else:
+                    # open migration ports in local machine using iptables
+                    Iptables.setup_or_cleanup_iptables_rules(rule,
+                                                             cleanup=cleanup)
                 # SMT for Power8 machine is turned off for local machine during
                 # test setup
             else:
-                # open migration ports in remote machine using iptables
-                Iptables.setup_or_cleanup_iptables_rules(iptable_rule,
-                                                         params=params,
-                                                         cleanup=cleanup)
-                cmd = "grep cpu /proc/cpuinfo | awk '{print $3}' | head -n 1"
-                server_ip = params.get("server_ip")
-                server_user = params.get("server_user", "root")
-                server_pwd = params.get("server_pwd")
+                server_ip = params.get("server_ip", params.get("remote_ip"))
+                server_user = params.get("server_user", params.get("remote_user"))
+                server_pwd = params.get("server_pwd", params.get("remote_pwd"))
                 server_session = remote.wait_for_login('ssh', server_ip, '22',
                                                        server_user, server_pwd,
                                                        r"[\#\$]\s*$")
+                if use_firewall_cmd:
+                    firewall_cmd = utils_iptables.Firewall_cmd(server_session)
+                    # open migration ports in remote machine using firewall_cmd
+                    if cleanup:
+                        firewall_cmd.remove_port(port_to_add, 'tcp', permanent=True)
+                    else:
+                        firewall_cmd.add_port(port_to_add, 'tcp', permanent=True)
+                else:
+                    # open migration ports in remote machine using iptables
+                    Iptables.setup_or_cleanup_iptables_rules(rule,
+                                                             params=params,
+                                                             cleanup=cleanup)
+                cmd = "grep cpu /proc/cpuinfo | awk '{print $3}' | head -n 1"
                 # Check if remote machine is Power8, if so check for smt state
                 # and turn off if it is on.
                 cmd_output = server_session.cmd_status_output(cmd)
@@ -1382,6 +1507,8 @@ class MigrationTest(object):
                      for process.run
 
         """
+        for vm in vms:
+            vm.connect_uri = args.get("virsh_uri", "qemu:///system")
         if migration_type == "orderly":
             for vm in vms:
                 migration_thread = threading.Thread(target=self.thread_func_migration,
@@ -1394,7 +1521,19 @@ class MigrationTest(object):
                 if func:
                     # Execute command once the migration is started
                     migrate_start_state = args.get("migrate_start_state", "paused")
-                    if self.wait_for_migration_start(vm, state=migrate_start_state, uri=desturi):
+
+                    # Wait for migration to start
+                    migrate_options = ""
+                    if options:
+                        migrate_options = str(options)
+                    if extra_opts:
+                        migrate_options += " %s" % extra_opts
+
+                    migration_started = self.wait_for_migration_start(vm, state=migrate_start_state,
+                                                                      uri=desturi,
+                                                                      migrate_options=migrate_options.strip())
+
+                    if migration_started:
                         logging.info("Migration started for %s", vm.name)
                         if func == process.run:
                             try:
@@ -1457,7 +1596,6 @@ class MigrationTest(object):
                     self.RET_LOCK.acquire()
                     self.RET_MIGRATION = False
                     self.RET_LOCK.release()
-
         if not self.RET_MIGRATION and not ignore_status:
             raise exceptions.TestFail()
 
@@ -1476,23 +1614,30 @@ class MigrationTest(object):
         # Set connect uri back to local uri
         vm.connect_uri = srcuri
 
-    def check_vm_state(self, vm, state='paused', uri=None):
+    def check_vm_state(self, vm_name, state='paused', reason=None, uri=None):
         """
         checks whether state of the vm is as expected
 
-        :param vm: VM Object
+        :param vm_name: VM name
         :param state: expected state of the VM
+        :param reason: expected reason of vm state
         :param uri: connect uri
 
         :return: True if state of VM is as expected, False otherwise
         """
-        if not virsh.domain_exists(vm.name, uri=uri):
+        if not virsh.domain_exists(vm_name, uri=uri):
             return False
-        result = virsh.domstate(vm.name, uri=uri)
+        if reason:
+            result = virsh.domstate(vm_name, extra="--reason", uri=uri)
+            expected_result = "%s (%s)" % (state.lower(), reason.lower())
+        else:
+            result = virsh.domstate(vm_name, uri=uri)
+            expected_result = state.lower()
         vm_state = results_stdout_52lts(result).strip()
-        return vm_state.lower() == state.lower()
+        return vm_state.lower() == expected_result
 
-    def wait_for_migration_start(self, vm, state='paused', uri=None, timeout=60):
+    def wait_for_migration_start(self, vm, state='paused', uri=None,
+                                 migrate_options='', timeout=60):
         """
         checks whether migration is started or not
 
@@ -1500,14 +1645,25 @@ class MigrationTest(object):
         :param state: expected VM state in destination host
         :param uri: connect uri
         :param timeout: time in seconds to wait for migration to start
+        :param migrate_options: virsh migrate options
 
         :return: True if migration is started False otherwise
         """
         def check_state():
             try:
-                return self.check_vm_state(vm, state, uri)
+                return self.check_vm_state(dest_vm_name, state, uri=uri)
             except Exception:
                 return False
+
+        # Set dest_vm_name to be used in wait_for_migration_start() in case
+        # --dname is specified in virsh options
+        dest_vm_name = ""
+        if migrate_options.count("--dname"):
+            migrate_options_list = migrate_options.split()
+            dest_vm_name = migrate_options_list[migrate_options_list.index("--dname") + 1]
+        else:
+            dest_vm_name = vm.name
+
         return utils_misc.wait_for(check_state, timeout)
 
 
@@ -1521,20 +1677,28 @@ def check_result(result,
     expectation.
 
     :param result: Command result instance.
-    :param expected_fails: list of regex of expected stderr patterns. The check
-                           will pass if any of these patterns matches.
-    :param skip_if: list of regex of expected patterns. The check will raise a
-                    TestSkipError if any of these patterns matches.
+    :param expected_fails: a string or list of regex of expected stderr patterns.
+                           The check will pass if any of these patterns matches.
+    :param skip_if: a string or list of regex of expected stderr patterns. The
+                    check will raise a TestSkipError if any of these patterns matches.
     :param any_error: Whether expect on any error message. Setting to True will
                       will override expected_fails
-    :param expected_match: list of regex of expected match. The check only check
-                           the stdout result
+    :param expected_match: a string or list of regex of expected stdout patterns.
+                           The check will pass if any of these patterns matches.
     """
     stderr = results_stderr_52lts(result)
     stdout = results_stdout_52lts(result)
     all_msg = '\n'.join([stdout, stderr])
     logging.debug("Command result: %s", all_msg)
+
+    try:
+        unicode
+    except NameError:
+        unicode = str
+
     if skip_if:
+        if isinstance(skip_if, (str, unicode)):
+            skip_if = [skip_if]
         for patt in skip_if:
             if re.search(patt, stderr):
                 raise exceptions.TestSkipError("Test skipped: found '%s' in test "
@@ -1549,11 +1713,15 @@ def check_result(result,
 
     if result.exit_status:
         if expected_fails:
+            if isinstance(expected_fails, (str, unicode)):
+                expected_fails = [expected_fails]
             if not any(re.search(patt, stderr)
                        for patt in expected_fails):
                 raise exceptions.TestFail("Expect should fail with one of %s, "
-                                          "but failed with: %s" %
+                                          "but failed with:\n%s" %
                                           (expected_fails, all_msg))
+            else:
+                logging.info("Get expect error msg:%s" % stderr)
         else:
             raise exceptions.TestFail(
                 "Expect should succeed, but got: %s" % all_msg)
@@ -1563,6 +1731,8 @@ def check_result(result,
                                       "but succeeded: %s" %
                                       (expected_fails, all_msg))
         elif expected_match:
+            if isinstance(expected_match, (str, unicode)):
+                expected_match = [expected_match]
             if not any(re.search(patt, stdout)
                        for patt in expected_match):
                 raise exceptions.TestFail("Expect should match with one of %s,"
@@ -1604,7 +1774,7 @@ def get_interface_details(vm_name):
     iface_cmd = {}
     ifaces_cmd = []
     for line in domiflist_out.split('\n'):
-        match_obj = rg.search(line)
+        match_obj = rg.search(line.strip())
         # Due to the extra space in the list
         if match_obj is not None:
             iface_cmd['interface'] = match_obj.group(1)
@@ -1698,13 +1868,22 @@ def check_iface(iface_name, checkpoint, extra="", **dargs):
     return check_pass
 
 
-def create_hostdev_xml(pci_id, boot_order=0):
+def create_hostdev_xml(pci_id, boot_order=None, xmlfile=True,
+                       dev_type="pci", managed="yes", alias=None):
     """
     Create a hostdev configuration file.
 
-    :param pci_id: such as "0000:03:04.0"
+    :param pci_id: such as "0000:03:04.0" for pci and "1d6b:0002:001:002" for
+                   usb (vendor:product:bus:device)
+    :param boot_order: boot order for hostdev device
+    :param xmlfile: Return the file path of xmlfile if True
+    :param dev_type: type of hostdev
+    :param managed: managed of hostdev
+    :param alias: alias name of hostdev
+    :return: xml of hostdev device by default
     """
     # Create attributes dict for device's address element
+    logging.info("pci_id is %s" % pci_id)
     device_domain = pci_id.split(':')[0]
     device_domain = "0x%s" % device_domain
     device_bus = pci_id.split(':')[1]
@@ -1716,15 +1895,73 @@ def create_hostdev_xml(pci_id, boot_order=0):
 
     hostdev_xml = hostdev.Hostdev()
     hostdev_xml.mode = "subsystem"
-    hostdev_xml.managed = "yes"
-    hostdev_xml.hostdev_type = "pci"
+    hostdev_xml.managed = managed
+    hostdev_xml.type = dev_type
     if boot_order:
         hostdev_xml.boot_order = boot_order
-    attrs = {'domain': device_domain, 'slot': device_slot,
-             'bus': device_bus, 'function': device_function}
-    hostdev_xml.source_address = hostdev_xml.new_source_address(**attrs)
+    if alias:
+        hostdev_xml.alias = dict(name=alias)
+    if dev_type == "pci":
+        attrs = {'domain': device_domain, 'slot': device_slot,
+                 'bus': device_bus, 'function': device_function}
+        hostdev_xml.source = hostdev_xml.new_source(**attrs)
+    if dev_type == "usb":
+        addr_bus = pci_id.split(':')[2]
+        addr_device = pci_id.split(':')[3]
+        hostdev_xml.source = hostdev_xml.new_source(
+            **(dict(vendor_id=device_domain, product_id=device_bus,
+                    address_bus=addr_bus, address_device=addr_device)))
+
     logging.debug("Hostdev XML:\n%s", str(hostdev_xml))
+    if not xmlfile:
+        return hostdev_xml
     return hostdev_xml.xml
+
+
+def create_controller_xml(contr_type='scsi', contr_model='virtio-scsi',
+                          contr_index='0', contr_alias=None):
+    """
+    Create controller xml
+
+    :param contr_type: controller type name
+    :param contr_model: controller device model
+    :param contr_index: controller device index
+    :param contr_alias: controller device alias name
+    :return: controller xml file
+    """
+    contr = controller.Controller(contr_type)
+    contr.model = contr_model
+    contr.index = contr_index
+    if contr_alias:
+        contr.alias = dict(name=contr_alias)
+    return contr.xml
+
+
+def create_redirdev_xml(redir_type="spicevmc", redir_bus="usb",
+                        redir_alias=None, redir_params={}):
+    """
+    Create redirdev xml
+
+    :param redir_type: redirdev type name
+    :param redir_bus: redirdev bus type
+    :param redir_alias: redirdev alias name
+    :param redir_params: others redir xml parameters
+    :return redirdev xml file
+    """
+    redir = redirdev.Redirdev(redir_type)
+    redir.type = redir_type
+    redir.bus = redir_bus
+    if redir_alias:
+        redir.alias = dict(name=redir_alias)
+    redir_source = redir_params.get("source")
+    if redir_source:
+        redir_source_dict = eval(redir_source)
+        redir.source = redir.new_source(**redir_source_dict)
+    redir_protocol = redir_params.get("protocol")
+    if redir_protocol:
+        redir.protocol = eval(redir_protocol)
+
+    return redir.xml
 
 
 def alter_boot_order(vm_name, pci_id, boot_order=0):
@@ -1771,6 +2008,9 @@ def create_disk_xml(params):
     diskxml = disk.Disk(type_name)
     diskxml.device = params.get("device_type", "disk")
     snapshot_attr = params.get('disk_snapshot_attr')
+    # After libvirt 3.9.0, auth element can be placed in source part.
+    # Use auth_in_source to diff whether it is placed in source or disk itself.
+    auth_in_source = params.get('auth_in_source')
     if snapshot_attr:
         diskxml.snapshot = snapshot_attr
     source_attrs = {}
@@ -1842,7 +2082,7 @@ def create_disk_xml(params):
         snapshot_name = params.get('source_snap_name')
         if snapshot_name:
             source_params.update({"snapshot_name": snapshot_name})
-        diskxml.source = diskxml.new_disk_source(**source_params)
+        disk_source = diskxml.new_disk_source(**source_params)
         auth_user = params.get("auth_user")
         secret_type = params.get("secret_type")
         secret_uuid = params.get("secret_uuid")
@@ -1856,7 +2096,11 @@ def create_disk_xml(params):
         elif secret_usage:
             auth_attrs['secret_usage'] = secret_usage
         if auth_attrs:
-            diskxml.auth = diskxml.new_auth(**auth_attrs)
+            if auth_in_source:
+                disk_source.auth = diskxml.new_auth(**auth_attrs)
+            else:
+                diskxml.auth = diskxml.new_auth(**auth_attrs)
+        diskxml.source = disk_source
         driver_name = params.get("driver_name", "qemu")
         driver_type = params.get("driver_type", "")
         driver_cache = params.get("driver_cache", "")
@@ -2234,7 +2478,10 @@ def create_channel_xml(params, alias=False, address=False):
                       'source': channel_source,
                       'target': channel_target}
     if alias:
-        channel_alias = target_name
+        if isinstance(alias, str):
+            channel_alias = alias
+        else:
+            channel_alias = target_name
         channel_params['alias'] = {'name': channel_alias}
     if address:
         channel_address = {'type': 'virtio-serial',
@@ -2360,7 +2607,7 @@ def set_vm_disk(vm, params, tmp_dir=None, test=None):
     logging.debug("original xml is: %s", vmxml.xmltreefile)
     disk_device = params.get("disk_device", "disk")
     disk_snapshot_attr = params.get("disk_snapshot_attr")
-    disk_type = params.get("disk_type")
+    disk_type = params.get("disk_type", "file")
     disk_target = params.get("disk_target", 'vda')
     disk_target_bus = params.get("disk_target_bus", "virtio")
     disk_src_protocol = params.get("disk_source_protocol")
@@ -2389,6 +2636,7 @@ def set_vm_disk(vm, params, tmp_dir=None, test=None):
     secret_type = params.get("secret_type")
     secret_usage = params.get("secret_usage")
     secret_uuid = params.get("secret_uuid")
+    enable_cache = "yes" == params.get("enable_cache", "yes")
     driver_cache = params.get("driver_cache", "none")
     disk_params = {'device_type': disk_device,
                    'disk_snapshot_attr': disk_snapshot_attr,
@@ -2396,7 +2644,6 @@ def set_vm_disk(vm, params, tmp_dir=None, test=None):
                    'target_dev': disk_target,
                    'target_bus': disk_target_bus,
                    'driver_type': disk_format,
-                   'driver_cache': driver_cache,
                    'driver_iothread': driver_iothread,
                    'sec_model': sec_model,
                    'relabel': relabel,
@@ -2406,6 +2653,8 @@ def set_vm_disk(vm, params, tmp_dir=None, test=None):
                    'secret_uuid': secret_uuid,
                    'secret_usage': secret_usage}
 
+    if enable_cache:
+        disk_params['driver_cache'] = driver_cache
     if not tmp_dir:
         tmp_dir = data_dir.get_tmp_dir()
 
@@ -2469,8 +2718,7 @@ def set_vm_disk(vm, params, tmp_dir=None, test=None):
                                'source_host_port': disk_src_port}
     elif disk_src_protocol == 'gluster':
         # Setup gluster.
-        host_ip = setup_or_cleanup_gluster(True, vol_name,
-                                           brick_path, pool_name)
+        host_ip = setup_or_cleanup_gluster(True, brick_path=brick_path, **params)
         logging.debug("host ip: %s " % host_ip)
         dist_img = "gluster.%s" % disk_format
 
@@ -3179,7 +3427,7 @@ def new_disk_vol_name(pool_name):
         return None
     disk = poolxml.get_source().device_path[5:]
     part_num = len(list(filter(lambda s: s.startswith(disk),
-                               get_parts_list())))
+                               utils_misc.utils_disk.get_parts_list())))
     return disk + str(part_num)
 
 
@@ -3383,6 +3631,8 @@ def modify_vm_iface(vm_name, oper, iface_dict, index=0):
     iface_mtu = iface_dict.get('mtu')
     iface_alias = iface_dict.get('alias')
     iface_virtualport_type = iface_dict.get('virtualport_type')
+    del_addr = iface_dict.get('del_addr')
+    del_rom = iface_dict.get('del_rom')
     if iface_type:
         iface.type_name = iface_type
     if iface_driver:
@@ -3392,6 +3642,8 @@ def modify_vm_iface(vm_name, oper, iface_dict, index=0):
             driver_guest=eval(driver_guest) if driver_guest else {})
     if iface_model:
         iface.model = iface_model
+    if del_rom:
+        iface.del_rom()
     if iface_rom:
         iface.rom = eval(iface_rom)
     if iface_inbound:
@@ -3407,6 +3659,8 @@ def modify_vm_iface(vm_name, oper, iface_dict, index=0):
     if iface_addr:
         iface.address = iface.new_iface_address(
             **{"attrs": eval(iface_addr)})
+    if del_addr:
+        iface.del_address()
     if iface_filter:
         iface.filterref = iface.new_filterref(name=iface_filter)
     if boot_order:
@@ -3550,6 +3804,30 @@ def customize_libvirt_config(params,
     return obj_conf
 
 
+def check_logfile(search_str, log_file, str_in_log=True,
+                  cmd_parms=None, runner_on_target=None):
+    """
+    Check if the given string exists in the log file
+
+    :param search_str: the string to be searched
+    :param log_file: the given file
+    :param str_in_log: Ture if the file should include the given string,
+                        otherwise, False
+    :param cmd_parms: The parms for remote executing
+    :param runner_on_target:  Remote runner
+    :raise: test.fail when the result is not expected
+    """
+    cmd = "grep -E '%s' %s" % (search_str, log_file)
+    if not (cmd_parms and runner_on_target):
+        cmdRes = process.run(cmd, shell=True, ignore_status=True)
+    else:
+        cmdRes = remote.run_remote_cmd(cmd, cmd_parms, runner_on_target)
+    if str_in_log == bool(int(cmdRes.exit_status)):
+        raise exceptions.TestFail("The string '{}' {} included in {}"
+                                  .format(search_str, "is not" if str_in_log else "is",
+                                          log_file))
+
+
 def check_qemu_cmd_line(content, err_ignore=False):
     """
     Check the specified content in the qemu command line
@@ -3591,3 +3869,39 @@ def get_disk_alias(vm, source_file=None):
                 logging.info("Ignore error of source attr getting for file: %s" % e)
                 pass
     return None
+
+
+def check_domuuid_compliant_with_rfc4122(dom_uuid_value):
+    """
+    Check the domain uuid format comply with RFC4122.
+    xxxxxxxx-xxxx-Axxx-Bxxx-xxxxxxxxxxxx
+    A should be RFC version number, since the compliant RFC version is 4122,
+    so it should be number 4.
+    B should be one of "8, 9, a or b".
+
+    :param dom_uuid_value: value of domain uuid
+    :return: True or False indicate whether it is compliant with RFC 4122.
+    """
+    dom_uuid_segments = dom_uuid_value.split('-')
+    return dom_uuid_segments[2].startswith('4') and dom_uuid_segments[3][0] in '89ab'
+
+
+def check_dumpxml(vm, content, err_ignore=False):
+    """
+    Check the specified content in the VM dumpxml
+
+    :param vm: VM object
+    :param content: the desired string to search
+    :param err_ignore: True to return False when fail
+                       False to raise exception when fail
+    :return: True if exist, False otherwise
+    """
+    v_xml = vm_xml.VMXML.new_from_dumpxml(vm.name)
+    with open(v_xml.xml) as xml_f:
+        if content not in xml_f.read():
+            if err_ignore:
+                return False
+            else:
+                raise exceptions.TestFail("Expected '%s' was not found in "
+                                          "%s's xml" % (content, vm.name))
+    return True

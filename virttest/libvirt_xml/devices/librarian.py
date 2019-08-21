@@ -11,8 +11,9 @@ from virttest.libvirt_xml import base
 DEVICE_TYPES = ['disk', 'filesystem', 'controller', 'lease',
                 'hostdev', 'redirdev', 'smartcard', 'interface', 'input',
                 'hub', 'graphics', 'video', 'parallel', 'serial', 'console',
-                'channel', 'sound', 'watchdog', 'memballoon', 'rng',
-                'seclabel', 'address', 'emulator', 'panic', 'memory']
+                'channel', 'sound', 'watchdog', 'memballoon', 'rng', 'vsock',
+                'seclabel', 'address', 'emulator', 'panic', 'memory', 'filterref',
+                'iommu', 'tpm']
 
 
 def get(name):

@@ -5,6 +5,7 @@ import re
 import aexpect
 from avocado.utils import download
 from avocado.utils import aurl
+from avocado.utils import wait
 
 from six.moves import xrange
 
@@ -81,10 +82,10 @@ class NetperfPackage(remote.Remote_Package):
         if client == "ssh":
             if self.netperf_source.endswith("tar.bz2"):
                 self.pack_suffix = ".tar.bz2"
-                self.decomp_cmd = "tar jxvf"
+                self.decomp_cmd = "tar jxf"
             elif self.netperf_source.endswith("tar.gz"):
                 self.pack_suffix = ".tar.gz"
-                self.decomp_cmd = "tar zxvf"
+                self.decomp_cmd = "tar zxf"
             self.netperf_dir = os.path.join(self.remote_path,
                                             self.netperf_file.rstrip(self.pack_suffix))
 
@@ -106,9 +107,6 @@ class NetperfPackage(remote.Remote_Package):
                                            linesep, timeout=360,
                                            status_test_command=status_test_command)
 
-    def __del__(self):
-        self.env_cleanup()
-
     def env_cleanup(self, clean_all=True):
         clean_cmd = ""
         if self.netperf_dir:
@@ -122,8 +120,13 @@ class NetperfPackage(remote.Remote_Package):
         pre_setup_cmd = "cd %s " % self.netperf_base_dir
         pre_setup_cmd += " && %s %s" % (self.decomp_cmd, self.netperf_file)
         pre_setup_cmd += " && cd %s " % self.netperf_dir
-        setup_cmd = "./configure %s > /dev/null " % compile_option
-        setup_cmd += " && make > /dev/null"
+        # Create dict to make other OS architectures easy to extend
+        build_type = {"aarch64": "aarch64-unknown-linux-gnu"}
+        build_arch = self.session.cmd_output("arch", timeout=60).strip()
+        np_build = build_type.get(build_arch, build_arch).strip()
+        setup_cmd = "./configure --build=%s %s > /dev/null 2>&1" % (np_build,
+                                                                    compile_option)
+        setup_cmd += " && make > /dev/null 2>&1"
         self.env_cleanup(clean_all=False)
         cmd = "%s && %s " % (pre_setup_cmd, setup_cmd)
         try:
@@ -179,7 +182,7 @@ class Netperf(object):
                  prompt="^root@.*[\#\$]\s*$|", linesep="\n", status_test_command="echo $?",
                  compile_option="--enable-demo=yes", install=True):
         """
-        Init NetperfServer class.
+        Init Netperf class.
 
         :param address: Remote host or guest address
         :param netperf_path: Remote netperf path
@@ -229,6 +232,15 @@ class Netperf(object):
             raise NetserverError("Cannot stop %s" % target)
         logging.info("Stop %s successfully" % target)
 
+    def cleanup(self, clean_all=True):
+        """
+        Cleanup the netperf packages.
+
+        :param clean_all: True to delete both netperf binary and source tarball
+                          and False to delete only binary.
+        """
+        self.package.env_cleanup(clean_all=clean_all)
+
 
 class NetperfServer(Netperf):
 
@@ -276,7 +288,7 @@ class NetperfServer(Netperf):
             logging.info("Start netserver with cmd: '%s'" % server_cmd)
             self.session.cmd_output_safe(server_cmd)
 
-        if not self.is_server_running():
+        if not wait.wait_for(self.is_server_running, 5):
             raise NetserverError("Can not start netperf server!")
         logging.info("Netserver start successfully")
 

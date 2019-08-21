@@ -14,22 +14,26 @@
 #
 # Copyright: IBM (c) 2017
 # Author: Satheesh Rajendran <sathnaga@linux.vnet.ibm.com>
+#         Hariharan T S <harihare@in.ibm.com>
 
 
 import re
 import json
 import logging
 import platform
+import time
 
-from . import virsh
-from . import libvirt_xml
-from . import utils_misc
-from . import utils_test
-from .utils_test import libvirt
-from .libvirt_xml.xcepts import LibvirtXMLNotFoundError
-from .compat_52lts import results_stdout_52lts, results_stderr_52lts
+from virttest import virsh
+from virttest import libvirt_xml
+from virttest import utils_misc
+from virttest import utils_test
+from virttest.utils_test import libvirt
+from virttest.libvirt_xml.devices import memory
+from virttest.libvirt_xml.xcepts import LibvirtXMLNotFoundError
+from virttest.compat_52lts import results_stdout_52lts, results_stderr_52lts
 from avocado.utils import cpu as utils
 from avocado.utils import software_manager
+from avocado.utils import process
 
 
 def get_cpu_xmldata(vm, options=""):
@@ -53,7 +57,8 @@ def get_cpu_xmldata(vm, options=""):
     try:
         cpu_xmldata['current_vcpu'] = int(vm_xml.current_vcpu)
     except LibvirtXMLNotFoundError:
-        logging.debug("current vcpu value not present in xml")
+        logging.debug("current vcpu value not present in xml, set as max value")
+        cpu_xmldata['current_vcpu'] = int(vm_xml.vcpu)
     cpu_xmldata['vcpu'] = int(vm_xml.vcpu)
     return cpu_xmldata
 
@@ -135,20 +140,23 @@ def affinity_from_xml(vm):
     return xml_affinity
 
 
-def affinity_from_vcpupin(vm):
+def affinity_from_vcpupin(vm, vcpu=None, options=None):
     """
     Returns dict of vcpu's affinity from virsh vcpupin output
 
     :param vm: VM object
-
+    :param vcpu: virtual cpu to qeury
+    :param options: --live, --current or --config
     :return: dict of affinity of VM
     """
     vcpupin_output = {}
     vcpupin_affinity = {}
     host_cpu_count = utils.total_cpus_count()
-    result = virsh.vcpupin(vm.name)
+    result = virsh.vcpupin(vm.name, vcpu=vcpu, options=options, debug=True)
     for vcpu in results_stdout_52lts(result).strip().split('\n')[2:]:
-        vcpupin_output[int(vcpu.split(":")[0])] = vcpu.split(":")[1]
+        # On newer version of libvirt, there is no ':' in
+        # vcpupin output anymore
+        vcpupin_output[int(vcpu.split()[0].rstrip(':'))] = vcpu.split()[1]
     for vcpu in vcpupin_output:
         vcpupin_affinity[vcpu] = libvirt.cpus_string_to_affinity_list(
             vcpupin_output[vcpu], host_cpu_count)
@@ -351,14 +359,17 @@ def check_xmlcount(vm, exp_vcpu, option):
     result = True
     cpu_xml = {}
     cpu_xml = get_cpu_xmldata(vm, option)
-    if 'config' in option:
-        if cpu_xml['current_vcpu'] != exp_vcpu['cur_config']:
-            logging.error("currrent vcpu number mismatch in xml\n"
-                          "Expected: %s\nActual:%s", exp_vcpu['cur_config'],
-                          cpu_xml['current_vcpu'])
-            result = False
-        else:
-            logging.debug("current vcpu count in xml check pass")
+    if "--config" in option or vm.is_dead():
+        exp_key = "cur_config"
+    else:
+        exp_key = "cur_live"
+    if cpu_xml['current_vcpu'] != exp_vcpu[exp_key]:
+        logging.error("currrent vcpu number mismatch in xml\n"
+                      "Expected: %s\nActual:%s", exp_vcpu[exp_key],
+                      cpu_xml['current_vcpu'])
+        result = False
+    else:
+        logging.debug("current vcpu count in xml check pass")
     if cpu_xml['vcpu'] != exp_vcpu['max_config']:
         logging.error("vcpu count mismatch in xml\nExpected: %s\nActual: %s",
                       exp_vcpu['max_config'], cpu_xml['vcpu'])
@@ -420,6 +431,45 @@ def get_cpustats(vm, cpu=None):
     return cpustats
 
 
+def get_domstats(vm, key):
+    """
+    Get VM's domstats output value for given keyword
+    :param vm: VM object
+    :param key: keyword for which value is needed
+    :return: value string
+    """
+    domstats_output = virsh.domstats(vm.name)
+    for item in results_stdout_52lts(domstats_output).strip().split():
+        if key in item:
+            return item.split("=")[1]
+
+
+def check_vcpu_domstats(vm, exp_vcpu):
+    """
+    Check the cpu values from domstats output
+    :param vm: VM object
+    :param exp_vcpu: dict of expected vcpus
+    :return: True if exp_vcpu matches the domstats output, False if not
+    """
+    status = True
+    cur_vcpu = int(get_domstats(vm, "vcpu.current"))
+    max_vcpu = int(get_domstats(vm, "vcpu.maximum"))
+    if vm.is_alive():
+        exp_cur_vcpu = exp_vcpu['cur_live']
+    else:
+        exp_cur_vcpu = exp_vcpu['cur_config']
+    if exp_cur_vcpu != cur_vcpu:
+        status = False
+        logging.error("Mismatch in current vcpu in domstats output, "
+                      "Expected: %s Actual: %s", exp_cur_vcpu, cur_vcpu)
+    if exp_vcpu['max_config'] != max_vcpu:
+        status = False
+        logging.error("Mismatch in maximum vcpu in domstats output, Expected:"
+                      " %s Actual: %s", exp_vcpu['max_config'], max_vcpu)
+
+    return status
+
+
 def check_vcpu_value(vm, exp_vcpu, vcpupin=None, option="", guest_agent=False):
     """
     Check domain vcpu, including vcpucount, vcpuinfo, vcpupin, vcpu number and
@@ -459,10 +509,16 @@ def check_vcpu_value(vm, exp_vcpu, vcpupin=None, option="", guest_agent=False):
     if not check_xmlcount(vm, exp_vcpu, option):
         final_result = False
 
-    # 1.5 Check inside the guest
     if vm.is_alive() and (not vm.is_paused()) and "live" in option:
+        # 1.5 Check inside the guest
         if not utils_misc.check_if_vm_vcpu_match(exp_vcpu['guest_live'], vm):
             final_result = False
+        # 1.6 Check guest numa
+        if not guest_numa_check(vm, exp_vcpu):
+            final_result = False
+    # 1.7 Check virsh domstats output
+    if not check_vcpu_domstats(vm, exp_vcpu):
+        final_result = False
 
     return final_result
 
@@ -483,3 +539,140 @@ def vcpuhotunplug_unsupport_str():
         return "not currently supported"
     else:
         return ""
+
+
+def create_mem_xml(tg_size, pg_size=None, mem_addr=None, tg_sizeunit="KiB",
+                   pg_unit="KiB", tg_node=0, node_mask=0, mem_model="dimm",
+                   lb_size=None, lb_sizeunit="Kib", mem_access=None):
+    """
+    Create memory device xml.
+    Parameters:
+    :param tg_size: Target hotplug memory size
+    :param pg_size: Source page size in case of hugepages backed.
+    :param mem_addr: Memory address to be mapped in guest.
+    :param tg_sizeunit: Target size unit, Default=KiB.
+    :param pg_unit: Source page size unit, Default=KiB.
+    :param tg_node: Target node to hotplug.
+    :param node_mask: Source node for hotplug.
+    :param mem_model: Memory Model, Default="dimm".
+    :param lb_size: Label size in Target
+    :param lb_sizeunit: Label size unit, Default=KiB
+    :param mem_access: Value of attrib 'access' of memory
+    :return: Returns a copy of Memory Hotplug xml instance.
+    """
+    mem_xml = memory.Memory()
+    mem_xml.mem_model = mem_model
+
+    if tg_size:
+        tg_xml = memory.Memory.Target()
+        tg_xml.size = int(tg_size)
+        tg_xml.size_unit = tg_sizeunit
+        if tg_node != "":
+            tg_xml.node = int(tg_node)
+        if lb_size:
+            lb_xml = memory.Memory.Target.Label()
+            lb_xml.size = int(lb_size)
+            lb_xml.size_unit = lb_sizeunit
+            tg_xml.label = lb_xml
+        mem_xml.target = tg_xml
+    if pg_size:
+        src_xml = memory.Memory.Source()
+        src_xml.pagesize = int(pg_size)
+        src_xml.pagesize_unit = pg_unit
+        src_xml.nodemask = node_mask
+        mem_xml.source = src_xml
+    if mem_addr:
+        mem_xml.address = mem_xml.new_mem_address(
+            **{"attrs": mem_addr})
+    if mem_access:
+        mem_xml.mem_access = mem_access
+
+    logging.debug("Memory device xml: %s", mem_xml)
+    return mem_xml.copy()
+
+
+def guest_numa_check(vm, exp_vcpu):
+    """
+    To check numa node values
+
+    :param vm: VM object
+    :param exp_vcpu: dict of expected vcpus
+    :return: True if check succeed, False otherwise
+    """
+    logging.debug("Check guest numa")
+    session = vm.wait_for_login()
+    vm_cpu_info = utils_misc.get_cpu_info(session)
+    session.close()
+    vmxml = libvirt_xml.VMXML.new_from_dumpxml(vm.name)
+    try:
+        node_num_xml = len(vmxml.cpu.numa_cell)
+    except (TypeError, LibvirtXMLNotFoundError):
+        # handle if no numa cell in guest xml, bydefault node 0
+        node_num_xml = 1
+    node_num_guest = int(vm_cpu_info["NUMA node(s)"])
+    exp_num_nodes = node_num_xml
+    status = True
+    for node in range(node_num_xml):
+        try:
+            node_cpu_xml = vmxml.cpu.numa_cell[node]['cpus']
+            node_cpu_xml = libvirt.cpus_parser(node_cpu_xml)
+        except (TypeError, LibvirtXMLNotFoundError):
+            try:
+                node_cpu_xml = vmxml.current_vcpu
+            except LibvirtXMLNotFoundError:
+                node_cpu_xml = vmxml.vcpu
+            node_cpu_xml = list(range(int(node_cpu_xml)))
+        try:
+            node_mem_xml = vmxml.cpu.numa_cell[node]['memory']
+        except (TypeError, LibvirtXMLNotFoundError):
+            node_mem_xml = vmxml.memory
+        node_mem_guest = int(vm.get_totalmem_sys(node=node))
+        node_cpu_xml_copy = node_cpu_xml[:]
+        for cpu in node_cpu_xml_copy:
+            if int(cpu) >= int(exp_vcpu["guest_live"]):
+                node_cpu_xml.remove(cpu)
+        if (not node_cpu_xml) and node_mem_guest == 0:
+            exp_num_nodes -= 1
+        try:
+            node_cpu_guest = vm_cpu_info["NUMA node%s CPU(s)" % node]
+            node_cpu_guest = libvirt.cpus_parser(node_cpu_guest)
+        except KeyError:
+            node_cpu_guest = []
+        # Check cpu
+        if node_cpu_xml != node_cpu_guest:
+            status = False
+            logging.error("Mismatch in cpus in node %s: xml %s guest %s", node,
+                          node_cpu_xml, node_cpu_guest)
+        # Check memory
+        if int(node_mem_xml) != node_mem_guest:
+            status = False
+            logging.error("Mismatch in memory in node %s: xml %s guest %s", node,
+                          node_mem_xml, node_mem_guest)
+    # Check no. of nodes
+    if exp_num_nodes != node_num_guest:
+        status = False
+        logging.error("Mismatch in numa nodes expected nodes: %s guest: %s", exp_num_nodes,
+                      node_num_guest)
+    return status
+
+
+def get_load_per(session=None, iterations=2, interval=10.0):
+    """
+    Get the percentage of load in Guest/Host
+    :param session: Guest Sesssion
+    :param iterations: iterations
+    :param interval: interval between load calculation
+    :return: load of system in percentage
+    """
+    idle_secs = []
+    idle_per = []
+    cmd = "cat /proc/uptime"
+    for itr in range(iterations):
+        if session:
+            idle_secs.append(float(session.cmd_output(cmd).strip().split()[1]))
+        else:
+            idle_secs.append(float(process.system_output(cmd).split()[1]))
+        time.sleep(interval)
+    for itr in range(iterations - 1):
+        idle_per.append((idle_secs[itr + 1] - idle_secs[itr]) / interval)
+    return int((1 - (sum(idle_per) / len(idle_per))) * 100)
