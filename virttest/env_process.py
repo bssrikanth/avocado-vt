@@ -1431,6 +1431,7 @@ def preprocess(test, params, env):
             threads = []
             nest_timeout = int(nest_params.get("nested_guest_timeout", "3600"))
             install_type = nest_params.get("avocado_guest_install_type", "git")
+            avocado_reinstall = bool('yes' == nest_params.get('avocado_guest_reinstall', 'no'))
             nest_vms = env.get_all_vms()
             # Have buffer memory 1G for VMs to work seamlessly
             nest_memory = (int(nest_params.get("mem")) // len(nest_vms)) - 1024
@@ -1464,7 +1465,7 @@ def preprocess(test, params, env):
                                               timeout=nest_timeout,
                                               installtype=install_type,
                                               avocado_vt=True,
-                                              reinstall=False,
+                                              reinstall=avocado_reinstall,
                                               add_args=avocadotestargs)
                 thread = threading.Thread(target=thread_func, args=(obj,))
                 threads.append(thread)
