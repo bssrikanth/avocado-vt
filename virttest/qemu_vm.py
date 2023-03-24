@@ -1057,12 +1057,16 @@ class VM(virt_vm.BaseVM):
                 if mem_params.get("slots"):
                     options.append("slots=%s" % mem_params["slots"])
             sgx_epc_memdev_id = dict()
+            sev_upm_memdev_id = dict()
             for name in params.objects("mem_devs"):
                 dev = devices.memory_define_by_params(params, name)
                 for ele in dev:
                     if isinstance(ele, qdevices.Memory) and \
                             ele.params["backend"] == "memory-backend-epc":
                         sgx_epc_memdev_id[name] = ele.get_qid()
+                    elif isinstance(ele, qdevices.Memory) and \
+                            ele.params["backend"] == "memory-backend-memfd-private":
+                        sev_upm_memdev_id[name] = ele.get_qid()
 
                     set_cmdline_format_by_cfg(ele,
                                               self._get_cmdline_format_cfg(),
@@ -1085,10 +1089,26 @@ class VM(virt_vm.BaseVM):
                     sgx_epc_cmd += ",{cap_type}.{idx}.{opt}=" \
                                    "{val}".format(cap_type=cap_type, idx=idx,
                                                   opt=opt, val=val)
+            sev_upm_cmd = ""
+            for idx, ele in enumerate(params.objects("vm_sev_upm_devs")):
+                sev_upm_params = params.object_params(ele)
+                sev_upm_memdev_ele = sev_upm_params["vm_sev_upm_memdev"]
+                if sev_upm_memdev_ele not in sev_upm_memdev_id:
+                    raise virt_vm.VMDeviceNotFoundError("Cannot find upm "
+                                                        "memory device mapped"
+                                                        " for sev-upm device "
+                                                        "%s." % ele)
+                opt_mapping = {
+                    'memory-backend': sev_upm_memdev_id[sev_upm_memdev_ele]}
+                for opt, val in opt_mapping.items():
+                    sev_upm_cmd += ",{opt}=" \
+                                   "{val}".format(opt=opt, val=val)
+                sev_upm_cmd +=",kvm-type=protected"
             machine_dev = devices.get_by_properties({"type": "machine"})[0]
             # FIXME:  QStringDevice does not support dynamic set after
             #  initialization.
             machine_dev._cmdline += sgx_epc_cmd
+            machine_dev._cmdline += sev_upm_cmd
             machine_cmd = machine_dev.cmdline_nd()
             output = re.findall(r",memory-backend=mem-([\w|-]+)", machine_cmd)
             if output:
@@ -1112,9 +1132,9 @@ class VM(virt_vm.BaseVM):
                         and not params.get("guest_numa_nodes"):
                     cmd = "-mem-path %s" % params["hugepage_path"]
                     devs.append(StrDev('mem-path', cmdline=cmd))
-
-            cmdline = "-m %s" % ",".join(map(str, options))
-            devs.insert(0, StrDev("mem", cmdline=cmdline))
+            if params.get("backend_mem") != "memory-backend-memfd-private":
+                cmdline = "-m %s" % ",".join(map(str, options))
+                devs.insert(0, StrDev("mem", cmdline=cmdline))
             devices.insert(devs)
             return devices
 

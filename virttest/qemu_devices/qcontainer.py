@@ -1497,9 +1497,9 @@ class DevContainer(object):
                     opt = "memory-backend"
                     backend_id = "machine_mem"
                     if re.search(r"%s=" % opt, machine_help, re.MULTILINE) \
-                            and not params.get("guest_numa_nodes"):
+                            and not params.get("guest_numa_nodes") \
+                            and not params.get("backend_mem") == "memory-backend-memfd-private":
                         cmd += ",memory-backend=mem-%s" % backend_id
-
                     # Add secure guest properties for machine option
                     if params.get('vm_secure_guest_type'):
                         cmd = secure_guest_handler(
@@ -2943,7 +2943,8 @@ class DevContainer(object):
         'memory-backend-ram'.
         """
         params = params.object_params("mem")
-        params.setdefault("backend", "memory-backend-ram")
+        if params.get("backend") != "memory-backend-memfd-private":
+            params.setdefault("backend", "memory-backend-ram")
         attrs = qdevices.Memory.__attributes__[params["backend"]][:]
         params = params.copy_from_keys(attrs)
         dev = qdevices.Memory(params["backend"], params)
