@@ -1483,7 +1483,6 @@ class DevContainer(object):
             split_machine_type = machine_type.split(':', 1)
             if len(split_machine_type) > 1:
                 avocado_machine, machine_type = split_machine_type
-
             if machine_type in self.__machines_info:
                 machine_params["type"] = machine_type
             elif params.get("invalid_machine_type", "no") == "yes":
@@ -2924,7 +2923,8 @@ class DevContainer(object):
         'memory-backend-ram'.
         """
         params = params.object_params("mem")
-        params.setdefault("backend", "memory-backend-ram")
+        if params.get("backend") != "memory-backend-memfd-private":
+            params.setdefault("backend", "memory-backend-ram")
         attrs = qdevices.Memory.__attributes__[params["backend"]][:]
         params = params.copy_from_keys(attrs)
         dev = qdevices.Memory(params["backend"], params)
