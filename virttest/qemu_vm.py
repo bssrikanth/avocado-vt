@@ -1064,13 +1064,16 @@ class VM(virt_vm.BaseVM):
                 if mem_params.get("slots"):
                     options.append("slots=%s" % mem_params["slots"])
             sgx_epc_memdev_id = dict()
+            sev_upm_memdev_id = dict()
             for name in params.objects("mem_devs"):
                 dev = devices.memory_define_by_params(params, name)
                 for ele in dev:
                     if isinstance(ele, qdevices.Memory) and \
                             ele.params["backend"] == "memory-backend-epc":
                         sgx_epc_memdev_id[name] = ele.get_qid()
-
+                    elif isinstance(ele, qdevices.Memory) and \
+                            ele.params["backend"] == "memory-backend-memfd":
+                        sev_upm_memdev_id[name] = ele.get_qid()
                     set_cmdline_format_by_cfg(ele,
                                               self._get_cmdline_format_cfg(),
                                               "mem_devs")
@@ -1091,9 +1094,23 @@ class VM(virt_vm.BaseVM):
                 for opt, val in opt_mapping.items():
                     sgx_epc_opt = f"{cap_type}.{idx}.{opt}"
                     machine_dev.set_param(sgx_epc_opt, val)
+            for idx, ele in enumerate(params.objects("vm_sev_upm_devs")):
+                sev_upm_params = params.object_params(ele)
+                sev_upm_memdev_ele = sev_upm_params["vm_sev_upm_memdev"]
+                if sev_upm_memdev_ele not in sev_upm_memdev_id:
+                    raise virt_vm.VMDeviceNotFoundError("Cannot find upm "
+                                                        "memory device mapped"
+                                                        " for sev-upm device "
+                                                        "%s." % ele)
+                opt_mapping = {
+                    'memory-backend': sev_upm_memdev_id[sev_upm_memdev_ele]}
+                for opt, val in opt_mapping.items():
+                    sev_upm_opt = f"{opt}"
+                    machine_dev.set_param(sev_upm_opt, val)
+                #machine_dev.set_param("kvm-type", "snp")
 
             if (Flags.MACHINE_MEMORY_BACKEND in devices.caps
-                    and not params.get("guest_numa_nodes")):
+                    and not params.get("guest_numa_nodes") and params.get("backend_mem") != "memory-backend-memfd"):
                 name = "machine_mem"
                 backend_options = {}
                 backend_options["size_mem"] = "%sM" % params["mem"]
@@ -1128,8 +1145,9 @@ class VM(virt_vm.BaseVM):
                     cmd = "-mem-path %s" % params["hugepage_path"]
                     devs.append(StrDev('mem-path', cmdline=cmd))
 
-            cmdline = "-m %s" % ",".join(map(str, options))
-            devs.insert(0, StrDev("mem", cmdline=cmdline))
+            if params.get("backend_mem") != "memory-backend-memfd":
+                cmdline = "-m %s" % ",".join(map(str, options))
+                devs.insert(0, StrDev("mem", cmdline=cmdline))
             devices.insert(devs)
             return devices
 

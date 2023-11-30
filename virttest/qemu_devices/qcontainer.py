@@ -2948,7 +2948,8 @@ class DevContainer(object):
         'memory-backend-ram'.
         """
         params = params.object_params("mem")
-        params.setdefault("backend", "memory-backend-ram")
+        if params.get("backend") != "memory-backend-memfd":
+            params.setdefault("backend", "memory-backend-ram")
         attrs = qdevices.Memory.__attributes__[params["backend"]][:]
         params = params.copy_from_keys(attrs)
         dev = qdevices.Memory(params["backend"], params)
@@ -3392,7 +3393,12 @@ class DevContainer(object):
             sev_common_props['reduced-phys-bits'] = int(params['vm_sev_reduced_phys_bits'])
             if params.get('vm_sev_upm_mode'):
                 sev_common_props['upm-mode'] = params['vm_sev_upm_mode']
+            if params.get('vm_sev_kernel_hashes'):
+                sev_common_props['kernel-hashes'] = params.get_boolean(
+                    'vm_sev_kernel_hashes'
+                )
             return sev_common_props
+
         def _gen_sev_obj_props(obj_id, params):
             """
             Generate the properties of the sev-guest object.
@@ -3413,10 +3419,6 @@ class DevContainer(object):
 
             # Set policy=3 if vm_sev_policy is not set
             sev_obj_props['policy'] = int(params.get('vm_sev_policy', 3))
-            if params.get('vm_sev_kernel_hashes'):
-                sev_obj_props['kernel-hashes'] = params.get_boolean(
-                    'vm_sev_kernel_hashes'
-                )
 
             return backend, sev_obj_props
         def _gen_snp_obj_props(obj_id, params):
