@@ -963,6 +963,7 @@ def preprocess(test, params, env):
         cpu_family = cpu_utils.get_family() if hasattr(cpu_utils, 'get_family') else cpu_utils.get_cpu_arch()
     except Exception:
         LOG.warning("Could not get host cpu family")
+    LOG.info("SRIKANTH: cpu family: %s", cpu_family)
     migration_setup = params.get("migration_setup", "no") == "yes"
     if cpu_family is not None and "power" in cpu_family:
         pvr_cmd = "grep revision /proc/cpuinfo | awk '{print $3}' | head -n 1"
