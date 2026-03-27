@@ -600,6 +600,13 @@ class BaseVM(object):
     LOGIN_TIMEOUT = 10
     LOGIN_WAIT_TIMEOUT = 240
     COPY_FILES_TIMEOUT = 600
+
+    def _login_wait_timeout(self):
+        """Outer login wait budget; honors cartesian login_timeout when set."""
+        try:
+            return int(self.params.get("login_timeout", self.LOGIN_WAIT_TIMEOUT))
+        except (TypeError, ValueError):
+            return self.LOGIN_WAIT_TIMEOUT
     MIGRATE_TIMEOUT = 3600
     REBOOT_TIMEOUT = 240
 
@@ -1216,7 +1223,7 @@ class BaseVM(object):
     def wait_for_login(
         self,
         nic_index=0,
-        timeout=LOGIN_WAIT_TIMEOUT,
+        timeout=None,
         internal_timeout=LOGIN_TIMEOUT,
         serial=False,
         restart_network=False,
@@ -1239,6 +1246,8 @@ class BaseVM(object):
             eg. during reboot or pause)
         :return: A ShellSession object.
         """
+        if timeout is None:
+            timeout = self._login_wait_timeout()
 
         def print_guest_network_info():
             """
@@ -1481,7 +1490,7 @@ class BaseVM(object):
 
     def wait_for_serial_login(
         self,
-        timeout=LOGIN_WAIT_TIMEOUT,
+        timeout=None,
         internal_timeout=LOGIN_TIMEOUT,
         restart_network=False,
         username=None,
@@ -1506,6 +1515,8 @@ class BaseVM(object):
             for backward compatibility.
         :return: ConsoleSession instance.
         """
+        if timeout is None:
+            timeout = self._login_wait_timeout()
         if recreate_serial_console:
             self.cleanup_serial_console()
             self.create_serial_console()

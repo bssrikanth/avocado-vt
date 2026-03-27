@@ -1547,10 +1547,10 @@ def postprocess(test, params, env):
             try:
                 # Test may be fast, guest could still be booting
                 if len(vm.virtnet) > 0:
-                    session = vm.wait_for_login(timeout=vm.LOGIN_WAIT_TIMEOUT)
+                    session = vm.wait_for_login()
                     session.close()
                 else:
-                    session = vm.wait_for_serial_login(timeout=vm.LOGIN_WAIT_TIMEOUT)
+                    session = vm.wait_for_serial_login()
                     session.close()
             except (remote.LoginError, virt_vm.VMError, IndexError) as e:
                 LOG.warning(e)

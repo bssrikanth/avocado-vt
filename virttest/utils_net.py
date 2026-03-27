@@ -3948,14 +3948,20 @@ def get_linux_iface_info(iface="", mac=None, session=None):
         return ip_info
 
 
-def update_mac_ip_address(vm, timeout=240):
+def update_mac_ip_address(vm, timeout=None):
     """
     Get mac and ip address from guest then update the mac pool and
     address cache
 
     :param vm: VM object.
     :param timeout: Time (seconds) to keep trying to log in.
+        If None, uses vm.params['login_timeout'] (default 240).
     """
+    if timeout is None:
+        try:
+            timeout = int(vm.params.get("login_timeout", 240))
+        except (TypeError, ValueError):
+            timeout = 240
     try:
         session = vm.wait_for_serial_login(timeout=timeout)
         addr_map = get_guest_address_map(session)

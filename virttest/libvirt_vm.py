@@ -2055,10 +2055,10 @@ class VM(virt_vm.BaseVM):
         Other connect_uri, call virt_vm.wait_for_login().
         """
         # Set the default value of parameters if user did not use it.
-        if not timeout:
-            timeout = super(VM, self).LOGIN_WAIT_TIMEOUT
+        if timeout is None:
+            timeout = self._login_wait_timeout()
 
-        if not internal_timeout:
+        if internal_timeout is None:
             internal_timeout = super(VM, self).LOGIN_TIMEOUT
 
         if self.is_lxc():
