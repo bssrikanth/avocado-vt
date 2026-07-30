@@ -130,6 +130,86 @@ def get_cpu_family():
     return cpu_family
 
 
+def get_amd_platform(min_platform=None):
+    """
+    Return the AMD platform codename for the host CPU and optionally
+    verify it meets a minimum platform requirement.
+
+    Maps CPU family and model to a platform name based on the ranges
+    defined in arch/x86/kernel/cpu/amd.c in the upstream Linux kernel.
+
+    Supported platforms in generation order:
+      - milan:   family=25, model 0-15
+      - genoa:   family=25, model 16-31
+      - bergamo: family=25, model 160-175
+      - turin:   family=26, model 0-47
+      - venice:  family=26, model 80-95, 128-175, 192-239
+
+    :param min_platform: optional minimum platform required by the caller
+        (e.g. "milan"). If the detected platform is older than this,
+        an OSError is raised. Case-insensitive. None means no check.
+    :type min_platform: str or None
+    :return: detected platform codename (e.g. "milan", "genoa", "venice")
+    :rtype: str
+    :raises ValueError: if min_platform is not a recognised platform name.
+    :raises OSError: if the CPU vendor is not AMD, the family/model is
+        unrecognised, or the host platform is older than min_platform.
+    """
+    # Ordered from oldest to newest. Each entry:
+    # (platform_name, family, [(model_min, model_max), ...])
+    # Ranges sourced from arch/x86/kernel/cpu/amd.c (upstream Linux kernel).
+    amd_platforms = [
+        ("milan",   25, [(0,   15)]),
+        ("genoa",   25, [(16,  31)]),
+        ("bergamo", 25, [(160, 175)]),
+        ("turin",   26, [(0,   47)]),
+        ("venice",  26, [(80,  95), (128, 175), (192, 239)]),
+    ]
+    platform_order = [p[0] for p in amd_platforms]
+
+    if min_platform is not None:
+        min_platform = min_platform.lower()
+        if min_platform not in platform_order:
+            raise ValueError(
+                f"Unknown platform '{min_platform}'. "
+                f"Valid options: {', '.join(platform_order)}"
+            )
+
+    if get_cpu_vendor_id() != "AuthenticAMD":
+        raise OSError("Platform detection is only supported on AMD CPUs.")
+
+    family = int(get_cpu_family())
+    model_re = "(?m)^model\s+:\s+(\d+)$"
+    with open("/proc/cpuinfo") as fd:
+        cpu_info = fd.read()
+    model_match = re.search(model_re, cpu_info)
+    if not model_match:
+        raise OSError("The cpu model was NOT found!")
+    model = int(model_match.groups()[0])
+
+    detected = None
+    for platform, fam, ranges in amd_platforms:
+        if fam == family and any(lo <= model <= hi for lo, hi in ranges):
+            detected = platform
+            break
+
+    if detected is None:
+        raise OSError(
+            f"Unrecognised AMD platform: family={family}, model={model}."
+        )
+
+    if min_platform is not None:
+        detected_idx = platform_order.index(detected)
+        required_idx = platform_order.index(min_platform)
+        if detected_idx < required_idx:
+            raise OSError(
+                f"Detected platform '{detected}' is older than the "
+                f"required minimum '{min_platform}'."
+            )
+
+    return detected
+
+
 def get_cpu_stepping():
     """
     Return the name of cpu stepping.
