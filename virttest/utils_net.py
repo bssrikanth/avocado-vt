@@ -1753,6 +1753,43 @@ def get_dhcp_client(session):
     raise exceptions.TestError("No dhcp client found on the system")
 
 
+def _guest_linux_ifname(session, mac_addr=None):
+    """
+    Resolve the guest interface to recover after a missed carrier-up event.
+    """
+    if mac_addr:
+        return get_linux_ifname(session, mac_addr)
+    try:
+        ifnames = get_linux_ifname(session, "")
+        if isinstance(ifnames, list) and ifnames:
+            return ifnames[0]
+    except exceptions.TestError:
+        pass
+    return "eth0"
+
+
+def _restart_linux_network_networkd(session, ifname, timeout):
+    """
+    Recover DHCP on systemd-networkd guests by forcing a fresh carrier event.
+
+    Some virtio-net reboot paths leave networkd stuck in no-carrier even though
+    the kernel reports carrier=1. Bouncing the link emits new netlink carrier
+    transitions; networkctl then reconfigures/renews when available.
+    """
+    bounce_cmd = "ip link set %s down; sleep 1; ip link set %s up" % (ifname, ifname)
+    session.cmd_output_safe(bounce_cmd, timeout=timeout)
+    session.cmd_output_safe("sleep 3", timeout=min(timeout, 15))
+    status, _ = utils_misc.cmd_status_output(
+        "command -v networkctl", shell=True, ignore_status=True, session=session
+    )
+    if status != 0:
+        return
+    for subcmd in ("reconfigure", "renew"):
+        session.cmd_output_safe(
+            "networkctl %s %s 2>&1" % (subcmd, ifname), timeout=timeout
+        )
+
+
 def restart_guest_network(
     session, mac_addr=None, os_type="linux", ip_version="ipv4", timeout=240
 ):
@@ -1766,16 +1803,28 @@ def restart_guest_network(
     :param timeout: timeout value for command.
     """
     if os_type == "linux":
-        dhcp_cmd, release_flag = get_dhcp_client(session)
+        ifname = _guest_linux_ifname(session, mac_addr)
+        try:
+            _restart_linux_network_networkd(session, ifname, timeout)
+        except (aexpect.ShellError, aexpect.ShellTimeoutError) as err:
+            LOG.warning("Carrier bounce/networkctl recovery failed: %s", err)
+
+        try:
+            dhcp_cmd, release_flag = get_dhcp_client(session)
+        except exceptions.TestError:
+            LOG.debug(
+                "No standalone DHCP client on guest; "
+                "relying on carrier bounce/networkctl recovery"
+            )
+            return
 
         if mac_addr:
-            nic_ifname = get_linux_ifname(session, mac_addr)
-            restart_cmd = "ifconfig %s up; " % nic_ifname
+            restart_cmd = "ifconfig %s up; " % ifname
             restart_cmd += "%s %s; " % (dhcp_cmd, release_flag)
             if ip_version == "ipv6":
-                restart_cmd += "%s -6 %s" % (dhcp_cmd, nic_ifname)
+                restart_cmd += "%s -6 %s" % (dhcp_cmd, ifname)
             else:
-                restart_cmd += "%s %s" % (dhcp_cmd, nic_ifname)
+                restart_cmd += "%s %s" % (dhcp_cmd, ifname)
         else:
             restart_cmd = "%s %s; " % (dhcp_cmd, release_flag)
             if ip_version == "ipv6":

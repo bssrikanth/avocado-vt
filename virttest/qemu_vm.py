@@ -5668,12 +5668,18 @@ class VM(virt_vm.BaseVM):
         if self.params.get("mac_changeable") == "yes":
             utils_net.update_mac_ip_address(self)
 
+        restart_network = self.params.get("restart_network_on_login", "no") == "yes"
         if serial:
             return self.wait_for_serial_login(
-                timeout=(timeout - shutdown_dur), status_check=False
+                timeout=(timeout - shutdown_dur),
+                restart_network=restart_network,
+                status_check=False,
             )
         return self.wait_for_login(
-            nic_index=nic_index, timeout=(timeout - shutdown_dur), status_check=False
+            nic_index=nic_index,
+            timeout=(timeout - shutdown_dur),
+            status_check=False,
+            restart_network=restart_network,
         )
 
     def send_key(self, keystr):

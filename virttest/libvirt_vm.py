@@ -2845,13 +2845,20 @@ class VM(virt_vm.BaseVM):
             self.cleanup_serial_console()
 
         error_context.context("logging in after reboot", LOG.info)
+        restart_network = self.params.get("restart_network_on_login", "no") == "yes"
         if serial:
             return self.wait_for_serial_login(
                 timeout=timeout,
+                restart_network=restart_network,
                 recreate_serial_console=True,
                 status_check=False,
             )
-        return self.wait_for_login(nic_index, timeout=timeout)
+        return self.wait_for_login(
+            nic_index,
+            timeout=timeout,
+            status_check=False,
+            restart_network=restart_network,
+        )
 
     def screendump(self, filename, debug=False):
         if debug:
